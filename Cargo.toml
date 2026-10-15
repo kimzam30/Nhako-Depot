@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/depot-core"]
+resolver = "3"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kimzam30/depot"
+authors = ["Kim <hakimgame30@gmail.com>"]
+
+[package]
+name = "depot"
+description = "See and manage every app installed on your Linux computer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+depot-core = { path = "crates/depot-core" }
+serde_json = "1"
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

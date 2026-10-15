@@ -1,0 +1,10 @@
+.pkg-card { padding: 16px 14px 12px 14px; }
+.pkg-card:hover { background: alpha(currentColor, .06); }
+.badge { border-radius: 99px; padding: 0 8px; font-size: 0.75em; font-weight: 700; }
+.badge-snap { background: alpha(#e95420, .18); color: #e95420; }
+.badge-deb { background: alpha(#d70a53, .16); color: #d70a53; }
+.badge-flatpak { background: alpha(#4a90d9, .18); color: #4a90d9; }
+.badge-manual { background: alpha(#2ec27e, .18); color: #2ec27e; }
+.badge-sys { background: alpha(currentColor, .10); }
+.badge-broken { background: alpha(#e5a50a, .20); color: #c88800; }
+.sidebar-section { margin: 12px 12px 4px 12px; }
