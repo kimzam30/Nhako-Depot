@@ -1,61 +1,99 @@
 # Depot
 
-**See every app on your Linux computer in one place, and remove the ones you don't need.**
+**See every app on your Linux computer in one place. Keep them up to date, and remove the ones you don't need.**
 
 Linux software comes from many places: your distro's packages, Snap, Flatpak, downloaded archives,
-AppImages and more. Depot puts all of it in one window, tells you how each app was installed in
-plain language, and removes it the right way, so you don't have to know which command to use.
+AppImages and more. Depot puts all of it in one window, tells you in plain language how each app was
+installed, and updates or removes it the right way, so you don't need to know which command to use.
 
-Depot is built for people who are new to Linux, and it is fast: a full scan of about 2,500 packages
-takes around 50 ms, from a single native binary of about 1 MB.
+Depot is made for people who are new to Linux, and it's fast: a full scan of about 2,500 packages
+takes around 50 ms, from a single native program of about 1 MB.
 
-## What it does today
+## What it does
 
-- Lists everything installed as **Deb** (apt), **Snap**, **Flatpak** or **by hand**.
-- Works out which package an app really belongs to, including launchers that install scripts copy
-  into place, so each app appears once with the right source.
-- Finds **broken launchers**: menu entries left behind after their program was removed.
-- Uninstalls through the right tool: apt, snap or flatpak. Before removing a Deb, it shows which
-  other packages would go with it. Hand-installed apps are **moved to the Trash**, so you can undo.
-- Keeps libraries and runtimes under **Advanced**, so the main view shows only your apps.
-- **Updates**: see newer versions for your apps (apt, Snap, Flatpak) and install them with one
-  click, or all at once. System libraries and runtimes are grouped into a single "System updates" entry.
+- **Shows everything installed** as **Deb** (apt), **Snap**, **Flatpak** or **Manual** (installed by hand),
+  each with a badge that explains what it means.
+- **Gets the source right.** Each app appears once, under the package it really came from, even
+  when an install script copied its launcher into place.
+- **Updates.** Lists newer versions of your apps with their old and new version numbers. Update
+  them one at a time or all at once. Libraries, drivers and runtimes are grouped into a single
+  "System updates" entry.
+- **Removes apps safely.** Before anything is removed, Depot shows exactly what will go with it.
+  Leftover packages that nothing needs any more are listed separately, and you can keep them.
+  Apps installed by hand are moved to the **Trash**, so you can undo.
+- **Finds broken launchers**: menu entries left behind after their program was removed.
+- **Keeps the clutter out of the way.** Libraries, command-line tools and runtimes live under
+  **Advanced**, so the main view shows only your apps.
+
+New to Depot? The **[step-by-step guide](docs/GUIDE.md)** walks you through everything.
+
+## Install
+
+Depot needs GTK 4.14 or newer and libadwaita 1.5 or newer: Ubuntu 24.04, Zorin OS 18, Linux Mint 22,
+Fedora 40, or anything newer. There are no ready-made downloads yet, so you build it once from source.
+It takes about five minutes.
+
+**1. Install the build tools** (asks for your password):
+
+```sh
+# Ubuntu, Zorin OS, Linux Mint, Debian
+sudo apt install git libgtk-4-dev libadwaita-1-dev pkg-config build-essential curl
+
+# Fedora
+sudo dnf install git gtk4-devel libadwaita-devel gcc curl
+```
+
+**2. Install Rust**, if you don't have it. Choose the default option when asked, then close and reopen
+the terminal:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+(Don't use `sudo apt install cargo`: the version in Ubuntu 24.04 is too old for Depot.)
+
+**3. Download Depot and install it:**
+
+```sh
+git clone https://github.com/kimzam30/Nhako-Depot.git
+cd Nhako-Depot
+./install.sh
+```
+
+Depot is installed just for you, in `~/.local`, so this step doesn't need your password. Open it
+from your app menu by searching for **Depot**.
+
+**Updating Depot itself:** go back to that folder and run `git pull && ./install.sh`.
+
+**Removing Depot:** run `./install.sh --uninstall` from the same folder.
 
 ## Roadmap
 
 - [x] Rust rewrite, same GTK 4 / libadwaita design
 - [x] Correct ownership detection (launcher copies, `Exec` targets, XDG overrides)
-- [ ] One card per app even when it's installed several ways
-- [x] Updates page: see available updates, then **Update** or **Update all** (PackageKit, Snap, Flatpak)
+- [x] Updates page with **Update** and **Update all** (PackageKit, Snap, Flatpak)
 - [x] Removal through PackageKit with progress and clean-up of unused dependencies
+- [ ] One card per app even when it's installed several ways
 - [ ] RPM (dnf, zypper) and Pacman (including AUR packages)
 - [ ] AppImage
 - [ ] Developer tools: pipx, cargo, npm, Homebrew, Nix
 - [ ] `.deb` and `.rpm` downloads on GitHub Releases
 
-## Build from source
-
-Requirements: GTK 4.14+, libadwaita 1.5+ (Ubuntu 24.04, Zorin OS 18, Fedora 40 or newer) and a Rust toolchain.
+## For developers
 
 ```sh
-# Debian / Ubuntu / Zorin
-sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config build-essential
-# Fedora
-sudo dnf install gtk4-devel libadwaita-devel
-
-cargo build --release
-./target/release/depot
+cargo test -p depot-core   # the engine's tests; doesn't need GTK installed
+cargo run --release        # run the app
 ```
 
 `depot --help` lists commands that work without opening a window, handy for bug reports:
 `--list-only` prints everything installed as JSON, `--updates` prints available updates, and
 `--simulate-remove NAME` / `--simulate-update` show what PackageKit would do without changing anything.
 
-## How it's built
-
 | Path | What's there |
 | --- | --- |
-| `crates/depot-core` | Inventory engine with no GTK dependency: one backend per install type, launcher ownership, caching |
+| `crates/depot-core` | Inventory engine with no GTK dependency: one backend per install type, launcher ownership, update matching, caching |
+| `src/packagekit.rs` | Small async PackageKit client over D-Bus |
 | `src/ui` | GTK 4 / libadwaita interface |
 | `data/` | Stylesheet, launcher, icon |
 
@@ -69,4 +107,3 @@ Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
-# Nhako-Depot
