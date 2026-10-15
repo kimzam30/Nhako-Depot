@@ -1,8 +1,11 @@
 //! Uninstall flow: check what would happen, confirm, run, report.
 
+use super::widgets::Progress;
 use super::{State, reload};
+use crate::packagekit::{self, PkPackage};
 use adw::prelude::*;
-use depot_core::backend::manual;
+use depot_core::backend::{dpkg, manual};
+use depot_core::updates::info;
 use depot_core::{Kind, Package};
 use gtk::{gio, glib};
 use std::path::{Path, PathBuf};
@@ -50,22 +53,91 @@ fn simulate_deb(id: &str) -> (Vec<String>, Option<String>) {
     (extra, blocked)
 }
 
+/// What removing a Debian package involves, worked out with a dry run.
+#[derive(Default)]
+struct DebPlan {
+    /// Packages that need this one and go with it.
+    deps: Vec<String>,
+    /// Automatically installed packages nothing needs any more.
+    orphans: Vec<String>,
+    blocked: Option<String>,
+    /// PackageKit's id for the package, when PackageKit will do the removal.
+    pk_id: Option<String>,
+}
+
+const SYSTEM_NEEDS_IT: &str = "Your system needs this package to work, so it can't be removed.";
+
+fn pk_names(list: &[PkPackage], skip: &str) -> Vec<String> {
+    let mut v: Vec<String> =
+        list.iter().filter(|p| p.info == info::REMOVING && p.id != skip).map(|p| p.name().to_string()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Dry-run the removal with PackageKit, or apt when PackageKit isn't installed.
+async fn plan_deb(p: &Package) -> DebPlan {
+    if packagekit::available().await
+        && let Ok(found) = packagekit::resolve_installed(std::slice::from_ref(&p.name)).await
+    {
+        let arch = p.id.split_once(':').map_or(dpkg::native_arch(), |(_, a)| a);
+        let target = found.iter().find(|k| {
+            let mut f = k.id.split(';');
+            f.next() == Some(p.name.as_str()) && matches!(f.nth(1), Some(a) if a == arch || a == "all")
+        });
+        if let Some(target) = target {
+            let ids = vec![target.id.clone()];
+            // two dry runs tell apart what must go with it and what is merely left unused
+            let with = packagekit::remove(&ids, true, true, |_, _| {}).await;
+            let without = packagekit::remove(&ids, true, false, |_, _| {}).await;
+            match (with, without) {
+                (Ok(with), Ok(without)) => {
+                    let deps = pk_names(&without, &target.id);
+                    let orphans = pk_names(&with, &target.id).into_iter().filter(|n| !deps.contains(n)).collect();
+                    return DebPlan { deps, orphans, blocked: None, pk_id: Some(target.id.clone()) };
+                }
+                (_, Err(e))
+                    if matches!(
+                        e.code,
+                        packagekit::ERROR_DEP_RESOLUTION_FAILED | packagekit::ERROR_CANNOT_REMOVE_SYSTEM_PACKAGE
+                    ) =>
+                {
+                    return DebPlan { blocked: Some(SYSTEM_NEEDS_IT.into()), ..Default::default() };
+                }
+                _ => {}
+            }
+        }
+    }
+    let id = p.id.clone();
+    let (deps, blocked) = gio::spawn_blocking(move || simulate_deb(&id)).await.unwrap_or_default();
+    DebPlan { deps, blocked, ..Default::default() }
+}
+
 pub fn start(st: &Rc<State>, p: &Rc<Package>, button: &gtk::Button) {
     button.set_sensitive(false);
     let (st, p, button) = (st.clone(), p.clone(), button.clone());
     glib::spawn_future_local(async move {
-        let (extra, blocked) = if p.kind == Kind::Deb {
-            let id = p.id.clone();
-            gio::spawn_blocking(move || simulate_deb(&id)).await.unwrap_or_default()
-        } else {
-            (Vec::new(), None)
-        };
+        let plan = if p.kind == Kind::Deb { plan_deb(&p).await } else { DebPlan::default() };
         button.set_sensitive(true);
-        confirm(&st, &p, extra, blocked);
+        confirm(&st, &p, plan);
     });
 }
 
-fn confirm(st: &Rc<State>, p: &Rc<Package>, extra: Vec<String>, blocked: Option<String>) {
+fn listing(lines: &[String]) -> gtk::ScrolledWindow {
+    let l = gtk::Label::builder().label(lines.join("\n")).xalign(0.0).selectable(true).build();
+    l.add_css_class("monospace");
+    let sc = gtk::ScrolledWindow::builder()
+        .child(&l)
+        .min_content_height(40)
+        .max_content_height(160)
+        .propagate_natural_height(true)
+        .build();
+    sc.add_css_class("card");
+    sc
+}
+
+fn confirm(st: &Rc<State>, p: &Rc<Package>, plan: DebPlan) {
+    let DebPlan { deps: extra, orphans, blocked, pk_id } = plan;
     if let Some(reason) = blocked {
         let d = adw::AlertDialog::builder().heading("Can't uninstall").body(reason).build();
         d.add_response("close", "Close");
@@ -88,36 +160,39 @@ fn confirm(st: &Rc<State>, p: &Rc<Package>, extra: Vec<String>, blocked: Option<
             format!("Only the launcher is moved to the Trash. The program itself ({}) is left untouched.", p.location)
         }
         Kind::Snap | Kind::Flatpak => "This removes the app from your computer.".to_string(),
-        Kind::Deb if extra.is_empty() => "The package will be removed with apt.".to_string(),
-        Kind::Deb => format!(
-            "The package will be removed with apt.\n\nThis will also remove {} package(s) that depend on it:",
-            extra.len()
-        ),
+        Kind::Deb if extra.is_empty() => "This removes it from your computer.".to_string(),
+        Kind::Deb => format!("This removes it from your computer, along with {} package(s) that need it:", extra.len()),
     };
     let d = adw::AlertDialog::builder().heading(heading).body(body).build();
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    let listing: Vec<String> = if p.kind == Kind::Manual {
+    let lines: Vec<String> = if p.kind == Kind::Manual {
         plan.files.iter().map(|f| short(f)).collect()
     } else {
         let mut e = extra.clone();
         e.sort();
         e
     };
-    if !listing.is_empty() && (p.kind != Kind::Manual || full_manual) {
-        let l = gtk::Label::builder().label(listing.join("\n")).xalign(0.0).selectable(true).build();
-        l.add_css_class("monospace");
-        let sc = gtk::ScrolledWindow::builder()
-            .child(&l)
-            .min_content_height(60)
-            .max_content_height(180)
-            .propagate_natural_height(true)
-            .build();
-        sc.add_css_class("card");
-        content.append(&sc);
+    if !lines.is_empty() && (p.kind != Kind::Manual || full_manual) {
+        content.append(&listing(&lines));
+    }
+    let clean = gtk::CheckButton::builder()
+        .label(format!(
+            "Also remove {} package{} that nothing else needs any more",
+            orphans.len(),
+            if orphans.len() == 1 { "" } else { "s" }
+        ))
+        .active(true)
+        .tooltip_text("These were installed automatically for other software that is no longer here.")
+        .build();
+    if !orphans.is_empty() {
+        content.append(&clean);
+        content.append(&listing(&orphans));
     }
     let purge = gtk::CheckButton::with_label(match p.kind {
         Kind::Snap => "Don't keep a backup snapshot of its data",
+        // apt's purge removes the package's files in /etc, not anything in your home folder
+        Kind::Deb => "Also delete its system-wide settings files",
         _ => "Also delete settings and data",
     });
     if p.kind == Kind::Manual {
@@ -129,14 +204,20 @@ fn confirm(st: &Rc<State>, p: &Rc<Package>, extra: Vec<String>, blocked: Option<
     }
     d.set_extra_child(Some(&content));
     d.add_response("cancel", "Cancel");
-    let action = if !extra.is_empty() && p.kind == Kind::Deb {
-        format!("Uninstall {} packages", 1 + extra.len())
-    } else if p.kind == Kind::Manual {
-        "Move to Trash".into()
-    } else {
-        "Uninstall".into()
+    let (kind, deps_n, orphans_n) = (p.kind, extra.len(), orphans.len());
+    let action = move |with_orphans: bool| {
+        let n = 1 + deps_n + if with_orphans { orphans_n } else { 0 };
+        match kind {
+            Kind::Manual => "Move to Trash".to_string(),
+            Kind::Deb if n > 1 => format!("Uninstall {n} packages"),
+            _ => "Uninstall".to_string(),
+        }
     };
-    d.add_response("remove", &action);
+    d.add_response("remove", &action(clean.is_active()));
+    {
+        let d = d.clone();
+        clean.connect_toggled(move |c| d.set_response_label("remove", &action(c.is_active())));
+    }
     d.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     d.set_default_response(Some("cancel"));
     d.set_close_response("cancel");
@@ -144,7 +225,7 @@ fn confirm(st: &Rc<State>, p: &Rc<Package>, extra: Vec<String>, blocked: Option<
     let (st, p) = (st.clone(), p.clone());
     d.connect_response(None, move |_, r| {
         if r == "remove" {
-            run(&st, &p, purge.is_active());
+            run(&st, &p, purge.is_active(), clean.is_active(), pk_id.clone());
         }
     });
 }
@@ -197,7 +278,23 @@ fn privileged(cmd: Vec<String>, root: bool) -> Outcome {
     }
 }
 
-fn run(st: &Rc<State>, p: &Rc<Package>, purge: bool) {
+async fn remove_with_packagekit(id: String, autoremove: bool, progress: Rc<Progress>) -> Outcome {
+    let r = packagekit::remove(&[id], false, autoremove, move |pct, pkg: Option<&PkPackage>| {
+        let frac = (pct <= 100).then(|| pct as f64 / 100.0);
+        match pkg {
+            Some(k) if k.info == info::REMOVING => progress.set(&format!("Removing {}…", k.name()), frac),
+            _ => progress.set("", frac),
+        }
+    })
+    .await;
+    match r {
+        Ok(_) => Outcome { code: 0, output: String::new() },
+        Err(e) if e.cancelled => Outcome { code: 126, output: e.details },
+        Err(e) => Outcome { code: 1, output: e.details },
+    }
+}
+
+fn run(st: &Rc<State>, p: &Rc<Package>, purge: bool, autoremove: bool, pk_id: Option<String>) {
     let (cmd, root): (Vec<String>, bool) = match p.kind {
         Kind::Manual => (Vec::new(), false),
         Kind::Flatpak => {
@@ -217,49 +314,34 @@ fn run(st: &Rc<State>, p: &Rc<Package>, purge: bool) {
             (c, true)
         }
         Kind::Deb => {
-            (vec!["apt-get".into(), if purge { "purge" } else { "remove" }.into(), "-y".into(), p.id.clone()], true)
+            let mut c = vec!["apt-get".to_string(), if purge { "purge" } else { "remove" }.into(), "-y".into()];
+            if autoremove {
+                c.push("--autoremove".into());
+            }
+            c.push(p.id.clone());
+            (c, true)
         }
     };
-    let busy = busy_dialog(st, p, root);
+    // PackageKit can't purge config files, so purging always goes through apt
+    let pk_id = pk_id.filter(|_| !purge);
+    let verb = if p.kind == Kind::Manual { "Moving" } else { "Removing" };
+    let hint = if root || pk_id.is_some() { "Approve the password prompt if it appears." } else { "" };
+    let opened = std::time::Instant::now();
+    let progress = Progress::show(&st.win, &format!("{verb} {}", p.title), hint);
     let (st, p) = (st.clone(), p.clone());
     glib::spawn_future_local(async move {
-        let started = std::time::Instant::now();
         let r = if p.kind == Kind::Manual {
             trash_manual(&p, purge).await
+        } else if let Some(id) = pk_id {
+            remove_with_packagekit(id, autoremove, progress.clone()).await
         } else {
             gio::spawn_blocking(move || privileged(cmd, root))
                 .await
                 .unwrap_or(Outcome { code: 1, output: "Crashed".into() })
         };
-        // a dialog closed while it is still opening stays open; give it a moment
-        if let Some(wait) = std::time::Duration::from_millis(400).checked_sub(started.elapsed()) {
-            glib::timeout_future(wait).await;
-        }
-        busy.force_close();
+        progress.close(opened).await;
         finish(&st, &p, r);
     });
-}
-
-fn busy_dialog(st: &State, p: &Package, root: bool) -> adw::Dialog {
-    let busy = adw::Dialog::builder().content_width(300).can_close(false).build();
-    let bx = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
-        .margin_top(28)
-        .margin_bottom(28)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-    bx.append(&gtk::Spinner::builder().spinning(true).width_request(32).height_request(32).build());
-    let verb = if p.kind == Kind::Manual { "Moving" } else { "Removing" };
-    let mut text = format!("{verb} {}…", p.title);
-    if root {
-        text.push_str("\nApprove the password prompt if it appears.");
-    }
-    bx.append(&gtk::Label::builder().label(text).justify(gtk::Justification::Center).build());
-    busy.set_child(Some(&bx));
-    busy.present(Some(&st.win));
-    busy
 }
 
 fn finish(st: &Rc<State>, p: &Package, r: Outcome) {

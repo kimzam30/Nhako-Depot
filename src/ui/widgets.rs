@@ -3,6 +3,8 @@
 use adw::prelude::*;
 use depot_core::{Kind, Package, Role};
 use gtk::{gio, glib, pango};
+use std::cell::Cell;
+use std::rc::Rc;
 
 pub fn label(text: &str, classes: &[&str]) -> gtk::Label {
     let l = gtk::Label::builder().label(text).xalign(0.0).build();
@@ -49,8 +51,13 @@ pub fn extra_badges(p: &Package) -> Vec<gtk::Label> {
 }
 
 pub fn gicon(p: &Package) -> gio::Icon {
-    let fallback = if p.role == Role::App { "application-x-executable" } else { "package-x-generic" };
-    match p.icon.as_deref() {
+    gicon_for(p.icon.as_deref(), p.role == Role::App)
+}
+
+/// Icon from a launcher's `Icon=` value (theme name or file path), with a generic fallback.
+pub fn gicon_for(icon: Option<&str>, app: bool) -> gio::Icon {
+    let fallback = if app { "application-x-executable" } else { "package-x-generic" };
+    match icon {
         Some(i) if i.starts_with('/') && std::path::Path::new(i).exists() => {
             gio::FileIcon::new(&gio::File::for_path(i)).upcast()
         }
@@ -67,6 +74,80 @@ pub fn gicon(p: &Package) -> gio::Icon {
             gio::ThemedIcon::new(if found { name } else { fallback }).upcast()
         }
         _ => gio::ThemedIcon::new(fallback).upcast(),
+    }
+}
+
+/// A modal dialog with a status line and a progress bar, for work the user has to wait for.
+pub struct Progress {
+    dialog: adw::Dialog,
+    status: gtk::Label,
+    bar: gtk::ProgressBar,
+    pulsing: Rc<Cell<bool>>,
+}
+
+impl Progress {
+    pub fn show(parent: &impl IsA<gtk::Widget>, title: &str, hint: &str) -> Rc<Progress> {
+        let dialog = adw::Dialog::builder().content_width(360).can_close(false).build();
+        let bx = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_top(28)
+            .margin_bottom(28)
+            .margin_start(24)
+            .margin_end(24)
+            .build();
+        let heading = label(title, &["title-4"]);
+        heading.set_halign(gtk::Align::Center);
+        bx.append(&heading);
+        let status = wrapped("", &["dim-label"]);
+        status.set_justify(gtk::Justification::Center);
+        status.set_xalign(0.5);
+        bx.append(&status);
+        let bar = gtk::ProgressBar::new();
+        bx.append(&bar);
+        if !hint.is_empty() {
+            let h = wrapped(hint, &["caption", "dim-label"]);
+            h.set_justify(gtk::Justification::Center);
+            h.set_xalign(0.5);
+            bx.append(&h);
+        }
+        dialog.set_child(Some(&bx));
+        dialog.present(Some(parent));
+        let pulsing = Rc::new(Cell::new(true));
+        let (b, p) = (bar.clone(), pulsing.clone());
+        glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+            if !b.is_mapped() && !p.get() {
+                return glib::ControlFlow::Break;
+            }
+            if p.get() {
+                b.pulse();
+            }
+            glib::ControlFlow::Continue
+        });
+        Rc::new(Progress { dialog, status, bar, pulsing })
+    }
+
+    /// Update the status line (empty text keeps the old one) and the bar (`None` = unknown, pulse).
+    pub fn set(&self, text: &str, fraction: Option<f64>) {
+        if !text.is_empty() {
+            self.status.set_text(text);
+        }
+        match fraction {
+            Some(f) => {
+                self.pulsing.set(false);
+                self.bar.set_fraction(f.clamp(0.0, 1.0));
+            }
+            None => self.pulsing.set(true),
+        }
+    }
+
+    /// Close once the dialog has finished opening (closing an opening dialog is ignored).
+    pub async fn close(&self, opened: std::time::Instant) {
+        if let Some(wait) = std::time::Duration::from_millis(400).checked_sub(opened.elapsed()) {
+            glib::timeout_future(wait).await;
+        }
+        self.pulsing.set(false);
+        self.dialog.force_close();
     }
 }
 

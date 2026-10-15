@@ -7,7 +7,7 @@ AppImages and more. Depot puts all of it in one window, tells you how each app w
 plain language, and removes it the right way, so you don't have to know which command to use.
 
 Depot is built for people who are new to Linux, and it is fast: a full scan of about 2,500 packages
-takes around 50 ms, from a single native binary under 1 MB.
+takes around 50 ms, from a single native binary of about 1 MB.
 
 ## What it does today
 
@@ -18,13 +18,16 @@ takes around 50 ms, from a single native binary under 1 MB.
 - Uninstalls through the right tool: apt, snap or flatpak. Before removing a Deb, it shows which
   other packages would go with it. Hand-installed apps are **moved to the Trash**, so you can undo.
 - Keeps libraries and runtimes under **Advanced**, so the main view shows only your apps.
+- **Updates**: see newer versions for your apps (apt, Snap, Flatpak) and install them with one
+  click, or all at once. System libraries and runtimes are grouped into a single "System updates" entry.
 
 ## Roadmap
 
 - [x] Rust rewrite, same GTK 4 / libadwaita design
 - [x] Correct ownership detection (launcher copies, `Exec` targets, XDG overrides)
 - [ ] One card per app even when it's installed several ways
-- [ ] Updates page: see available updates, then **Update** or **Update all** (PackageKit, Snap, Flatpak)
+- [x] Updates page: see available updates, then **Update** or **Update all** (PackageKit, Snap, Flatpak)
+- [x] Removal through PackageKit with progress and clean-up of unused dependencies
 - [ ] RPM (dnf, zypper) and Pacman (including AUR packages)
 - [ ] AppImage
 - [ ] Developer tools: pipx, cargo, npm, Homebrew, Nix
@@ -44,7 +47,9 @@ cargo build --release
 ./target/release/depot
 ```
 
-`depot --list-only` prints the full inventory as JSON without opening a window. It's handy for bug reports.
+`depot --help` lists commands that work without opening a window, handy for bug reports:
+`--list-only` prints everything installed as JSON, `--updates` prints available updates, and
+`--simulate-remove NAME` / `--simulate-update` show what PackageKit would do without changing anything.
 
 ## How it's built
 

@@ -61,6 +61,58 @@ pub fn parse(text: &str) -> Vec<Package> {
         .collect()
 }
 
+/// A Flatpak ref with a newer commit on its remote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlatpakUpdate {
+    pub r#ref: String,
+    pub appid: String,
+    pub version: String,
+    pub runtime: bool,
+    pub system: bool,
+}
+
+/// Refs with updates in one installation. Contacts the remotes, so it can be slow.
+pub fn updates(system: bool) -> Result<Vec<FlatpakUpdate>, String> {
+    let out = match Command::new("flatpak")
+        .args([
+            "remote-ls",
+            if system { "--system" } else { "--user" },
+            "--updates",
+            "--columns=ref,application,version",
+        ])
+        .env("LC_ALL", "C.UTF-8")
+        .env("LANGUAGE", "C")
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Couldn't run flatpak: {e}")),
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        // an installation with no remotes isn't a problem
+        if err.contains("No remote") || err.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(format!("Flatpak couldn't check for updates: {}", err.trim()));
+    }
+    Ok(parse_updates(&String::from_utf8_lossy(&out.stdout), system))
+}
+
+pub fn parse_updates(text: &str, system: bool) -> Vec<FlatpakUpdate> {
+    text.lines()
+        .filter_map(|line| {
+            let mut c = line.split('\t').map(str::trim);
+            let full = c.next().filter(|r| !r.is_empty())?;
+            let appid = c.next().unwrap_or("").to_string();
+            let version = c.next().unwrap_or("").to_string();
+            let runtime = full.starts_with("runtime/");
+            let r#ref = full.split_once('/').filter(|(t, _)| matches!(*t, "app" | "runtime")).map_or(full, |(_, r)| r);
+            Some(FlatpakUpdate { r#ref: r#ref.to_string(), appid, version, runtime, system })
+        })
+        .collect()
+}
+
 /// Parse sizes like `1.2 GB` or `512.0 kB`.
 pub fn parse_size(s: &str) -> u64 {
     let s = s.replace('\u{a0}', " ");
@@ -113,5 +165,16 @@ mod tests {
         assert!(!p[1].system);
         assert_eq!(p[1].description, "⚠ End of life: old, update");
         assert_eq!(p[0].id, "org.gimp.GIMP/x86_64/stable");
+    }
+
+    #[test]
+    fn parse_remote_updates() {
+        let t = "app/com.discordapp.Discord/x86_64/stable\tcom.discordapp.Discord\t1.0.161\n\
+                 runtime/org.gnome.Platform/x86_64/51\torg.gnome.Platform\t\n";
+        let u = parse_updates(t, true);
+        assert_eq!(u[0].r#ref, "com.discordapp.Discord/x86_64/stable");
+        assert!(!u[0].runtime && u[0].system);
+        assert!(u[1].runtime);
+        assert_eq!(u[1].version, "");
     }
 }

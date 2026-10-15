@@ -2,6 +2,7 @@
 
 mod detail;
 mod remove;
+mod updates;
 mod widgets;
 
 use adw::prelude::*;
@@ -75,6 +76,15 @@ const CATS: &[Cat] = &[
     },
 ];
 
+/// What a sidebar row opens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nav {
+    Cat(usize),
+    Updates,
+    /// Shows or hides the advanced categories.
+    Advanced,
+}
+
 pub struct State {
     pub win: adw::ApplicationWindow,
     pub toasts: adw::ToastOverlay,
@@ -84,10 +94,15 @@ pub struct State {
     filtered: gtk::FilterListModel,
     stack: gtk::Stack,
     loading: Cell<bool>,
-    /// Sidebar rows; `None` marks the "Advanced" toggle row.
-    rows: Vec<(gtk::ListBoxRow, Option<usize>, gtk::Label)>,
+    rows: Vec<(gtk::ListBoxRow, Nav, gtk::Label)>,
     show_advanced: Cell<bool>,
     cat: Rc<Cell<usize>>,
+    /// Everything installed, as last read; update checks match against it.
+    packages: RefCell<Rc<Vec<Package>>>,
+    updates: updates::View,
+    /// "browse" (the grid) or "updates".
+    view: gtk::Stack,
+    browse_tools: Vec<gtk::Widget>,
 }
 
 impl State {
@@ -126,6 +141,9 @@ pub fn activate(app: &adw::Application) {
         .title("Depot")
         .default_width(1100)
         .default_height(720)
+        // required by the narrow-window breakpoint; 360 px is GNOME's smallest phone width
+        .width_request(360)
+        .height_request(400)
         .build();
     let toasts = adw::ToastOverlay::new();
     let nav = adw::NavigationView::new();
@@ -141,7 +159,7 @@ pub fn activate(app: &adw::Application) {
     let catlist = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
     catlist.add_css_class("navigation-sidebar");
     let mut rows = Vec::new();
-    let mut add_row = |name: &str, icon: &str, idx: Option<usize>| {
+    let mut add_row = |name: &str, icon: &str, nav: Nav| {
         let row = gtk::ListBoxRow::new();
         let bx = gtk::Box::builder().spacing(10).margin_top(8).margin_bottom(8).margin_start(6).margin_end(6).build();
         bx.append(&gtk::Image::from_icon_name(icon));
@@ -156,19 +174,22 @@ pub fn activate(app: &adw::Application) {
         let cnt = widgets::label("", &["dim-label", "caption"]);
         bx.append(&cnt);
         row.set_child(Some(&bx));
-        if idx.is_none() {
+        if nav == Nav::Advanced {
             row.set_selectable(false);
             row.set_tooltip_text(Some("Libraries, command-line tools and runtimes. Most people never need these."));
         }
         catlist.append(&row);
-        rows.push((row, idx, cnt));
+        rows.push((row, nav, cnt));
     };
     for (i, c) in CATS.iter().enumerate().filter(|(_, c)| !c.advanced) {
-        add_row(c.name, c.icon, Some(i));
+        add_row(c.name, c.icon, Nav::Cat(i));
+        if i == 0 {
+            add_row("Updates", "software-update-available-symbolic", Nav::Updates);
+        }
     }
-    add_row("Advanced", "pan-end-symbolic", None);
+    add_row("Advanced", "pan-end-symbolic", Nav::Advanced);
     for (i, c) in CATS.iter().enumerate().filter(|(_, c)| c.advanced) {
-        add_row(c.name, c.icon, Some(i));
+        add_row(c.name, c.icon, Nav::Cat(i));
     }
     sb.set_content(Some(
         &gtk::ScrolledWindow::builder().child(&catlist).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build(),
@@ -189,6 +210,8 @@ pub fn activate(app: &adw::Application) {
     hb.set_title_widget(Some(&adw::Clamp::builder().maximum_size(420).child(&search).build()));
     let refresh = gtk::Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Refresh").build();
     hb.pack_end(&refresh);
+    let upd = updates::View::new();
+    hb.pack_end(&upd.update_all);
     let sort_dd = gtk::DropDown::from_strings(&["Name", "Size (largest first)"]);
     sort_dd.set_tooltip_text(Some("Sort by"));
     hb.pack_end(&sort_dd);
@@ -234,7 +257,10 @@ pub fn activate(app: &adw::Application) {
             .build(),
         Some("empty"),
     );
-    tv.set_content(Some(&stack));
+    let view = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
+    view.add_named(&stack, Some("browse"));
+    view.add_named(&upd.root, Some("updates"));
+    tv.set_content(Some(&view));
     split.set_content(Some(&tv));
 
     // narrow windows: the sidebar slides over the grid instead of squeezing it
@@ -262,6 +288,10 @@ pub fn activate(app: &adw::Application) {
         rows,
         show_advanced: Cell::new(false),
         cat,
+        packages: RefCell::new(Rc::new(Vec::new())),
+        updates: upd,
+        view,
+        browse_tools: vec![search.clone().upcast(), sort_dd.clone().upcast()],
     });
 
     // ---- signals
@@ -279,7 +309,7 @@ pub fn activate(app: &adw::Application) {
     {
         let st = st.clone();
         catlist.connect_row_activated(move |_, row| {
-            if st.rows.iter().any(|(r, idx, _)| r == row && idx.is_none()) {
+            if st.rows.iter().any(|(r, nav, _)| r == row && *nav == Nav::Advanced) {
                 st.show_advanced.set(!st.show_advanced.get());
                 update_rows(&st);
             }
@@ -290,12 +320,23 @@ pub fn activate(app: &adw::Application) {
         let split = split.clone();
         catlist.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
-            if let Some((_, Some(i), _)) = st.rows.iter().find(|(r, _, _)| r == row) {
-                st.cat.set(*i);
-                filter.changed(gtk::FilterChange::Different);
-                if split.is_collapsed() {
-                    split.set_show_sidebar(false);
+            let Some(&(_, nav, _)) = st.rows.iter().find(|(r, _, _)| r == row) else { return };
+            let on_updates = nav == Nav::Updates;
+            st.view.set_visible_child_name(if on_updates { "updates" } else { "browse" });
+            for w in &st.browse_tools {
+                w.set_visible(!on_updates);
+            }
+            st.updates.update_all.set_visible(on_updates && st.updates.count() > 0);
+            match nav {
+                Nav::Cat(i) => {
+                    st.cat.set(i);
+                    filter.changed(gtk::FilterChange::Different);
                 }
+                Nav::Updates if st.updates.is_stale() => updates::check(&st, true),
+                _ => {}
+            }
+            if split.is_collapsed() {
+                split.set_show_sidebar(false);
             }
         });
     }
@@ -303,7 +344,20 @@ pub fn activate(app: &adw::Application) {
     sort_dd.connect_selected_notify(move |dd| sorted.set_sorter(Some(&sorter(dd.selected()))));
     {
         let st = st.clone();
-        refresh.connect_clicked(move |_| reload(&st));
+        refresh.connect_clicked(move |_| {
+            if st.view.visible_child_name().as_deref() == Some("updates") {
+                updates::check(&st, true);
+            } else {
+                reload(&st);
+            }
+        });
+    }
+    {
+        let st = st.clone();
+        st.clone().updates.update_all.connect_clicked(move |_| {
+            let all = st.updates.pending();
+            updates::run(&st, all);
+        });
     }
     {
         let st = st.clone();
@@ -350,14 +404,15 @@ fn update_stack(st: &State) {
 /// Show or hide sidebar rows: advanced ones follow the toggle, empty ones hide (except "All apps").
 fn update_rows(st: &State) {
     let adv = st.show_advanced.get();
-    for (row, idx, cnt) in &st.rows {
-        match idx {
-            None => {
+    for (row, nav, cnt) in &st.rows {
+        match nav {
+            Nav::Updates => row.set_visible(true),
+            Nav::Advanced => {
                 if let Some(img) = row.child().and_then(|b| b.first_child()).and_downcast::<gtk::Image>() {
                     img.set_icon_name(Some(if adv { "pan-down-symbolic" } else { "pan-end-symbolic" }));
                 }
             }
-            Some(i) => {
+            Nav::Cat(i) => {
                 let empty = !st.loading.get() && cnt.text() == "0";
                 let selected = *i == st.cat.get();
                 row.set_visible(selected || ((!CATS[*i].advanced || adv) && (*i == 0 || !empty)));
@@ -376,8 +431,21 @@ pub fn reload(st: &Rc<State>) {
     });
 }
 
-fn loaded(st: &State, inv: Inventory) {
+/// Show the number of pending updates next to "Updates".
+fn update_counts(st: &State) {
+    let n = st.updates.count();
+    for (_, nav, cnt) in &st.rows {
+        if *nav == Nav::Updates {
+            cnt.set_text(&if n == 0 { String::new() } else { n.to_string() });
+        }
+    }
+    let on_updates = st.view.visible_child_name().as_deref() == Some("updates");
+    st.updates.update_all.set_visible(on_updates && n > 0);
+}
+
+fn loaded(st: &Rc<State>, inv: Inventory) {
     let mut counts = vec![0usize; CATS.len()];
+    *st.packages.borrow_mut() = Rc::new(inv.packages.clone());
     let items: Vec<glib::BoxedAnyObject> = inv
         .packages
         .into_iter()
@@ -393,8 +461,8 @@ fn loaded(st: &State, inv: Inventory) {
         })
         .collect();
     st.store.splice(0, st.store.n_items(), &items);
-    for (_, idx, cnt) in &st.rows {
-        if let Some(i) = idx {
+    for (_, nav, cnt) in &st.rows {
+        if let Nav::Cat(i) = nav {
             cnt.set_text(&counts[*i].to_string());
         }
     }
@@ -404,4 +472,8 @@ fn loaded(st: &State, inv: Inventory) {
     for w in inv.warnings {
         st.toast(&w);
     }
+    // keep the Updates count current: in the background, without re-downloading package lists,
+    // or with them if the Updates page asked while the list was loading
+    let queued = st.updates.take_queued();
+    updates::check(st, queued.unwrap_or(false));
 }

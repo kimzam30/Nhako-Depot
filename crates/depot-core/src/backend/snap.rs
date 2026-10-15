@@ -11,21 +11,27 @@ pub const SOCKET: &str = "/run/snapd.socket";
 pub const DESKTOP_DIR: &str = "/var/lib/snapd/desktop/applications";
 const PROTECTED_TYPES: &[&str] = &["base", "os", "snapd", "core", "kernel", "gadget"];
 
-/// Minimal HTTP/1.0 GET. snapd answers 1.0 requests without chunking and closes the connection.
-fn get(socket: &Path, path: &str) -> Result<Vec<u8>, String> {
+/// Minimal HTTP/1.0 GET returning the status code and body.
+/// snapd answers 1.0 requests without chunking and closes the connection.
+fn request(socket: &Path, path: &str, timeout: Duration) -> Result<(u16, Vec<u8>), String> {
     let mut s = UnixStream::connect(socket).map_err(|e| format!("snapd isn't reachable: {e}"))?;
-    let t = Some(Duration::from_secs(3));
-    let _ = s.set_read_timeout(t);
-    let _ = s.set_write_timeout(t);
+    let _ = s.set_read_timeout(Some(timeout));
+    let _ = s.set_write_timeout(Some(timeout));
     s.write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).map_err(|e| format!("snapd didn't answer: {e}"))?;
     let split = buf.windows(4).position(|w| w == b"\r\n\r\n").ok_or("snapd sent a malformed reply")?;
     let head = String::from_utf8_lossy(&buf[..split]);
-    if !head.lines().next().is_some_and(|l| l.contains(" 200 ")) {
-        return Err(format!("snapd replied: {}", head.lines().next().unwrap_or("")));
+    let status =
+        head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse().ok()).unwrap_or(0);
+    Ok((status, buf[split + 4..].to_vec()))
+}
+
+fn get(socket: &Path, path: &str) -> Result<Vec<u8>, String> {
+    match request(socket, path, Duration::from_secs(3))? {
+        (200, body) => Ok(body),
+        (code, _) => Err(format!("snapd replied with status {code}")),
     }
-    Ok(buf[split + 4..].to_vec())
 }
 
 pub fn load(socket: &Path) -> Result<Vec<Package>, String> {
@@ -81,6 +87,31 @@ pub fn parse(v: &Value) -> Vec<Package> {
         .collect()
 }
 
+/// Snaps with a newer revision in their channel, as `(name, new version)`. Asks the store, so it can be slow.
+pub fn refreshable(socket: &Path) -> Result<Vec<(String, String)>, String> {
+    if !socket.exists() {
+        return Ok(Vec::new());
+    }
+    let (code, body) = request(socket, "/v2/find?select=refresh", Duration::from_secs(30))?;
+    let v: Value = serde_json::from_slice(&body).map_err(|e| format!("snapd sent invalid data: {e}"))?;
+    match code {
+        200 => Ok(parse_refresh(&v)),
+        // older snapd reports "nothing to refresh" as an error
+        404 => Ok(Vec::new()),
+        _ => Err(v["result"]["message"].as_str().unwrap_or("snapd couldn't check for updates").to_string()),
+    }
+}
+
+pub fn parse_refresh(v: &Value) -> Vec<(String, String)> {
+    let Some(list) = v.get("result").and_then(Value::as_array) else { return Vec::new() };
+    list.iter()
+        .filter_map(|o| {
+            let name = o.get("name")?.as_str()?.to_string();
+            Some((name, o.get("version").and_then(Value::as_str).unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
 /// Icon shipped inside the snap, for snaps whose launcher has none.
 pub fn bundled_icon(name: &str) -> Option<String> {
     ["png", "svg"].iter().map(|ext| format!("/snap/{name}/current/meta/gui/icon.{ext}")).find(|p| Path::new(p).exists())
@@ -103,5 +134,11 @@ mod tests {
         assert_eq!(p[2].title, "Spotify");
         assert_eq!(p[2].publisher, "Spotify ✔");
         assert_eq!(p[2].revision, "80");
+    }
+
+    #[test]
+    fn parse_refreshes() {
+        let v = serde_json::json!({"result": [{"name": "spotify", "version": "1.3"}, {"bad": 1}]});
+        assert_eq!(super::parse_refresh(&v), [("spotify".to_string(), "1.3".to_string())]);
     }
 }

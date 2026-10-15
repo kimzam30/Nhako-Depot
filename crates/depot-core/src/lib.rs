@@ -6,7 +6,9 @@ pub mod desktop;
 pub mod exec;
 pub mod inventory;
 pub mod model;
+pub mod updates;
 pub mod xdg;
 
 pub use inventory::{Env, Inventory, scan};
 pub use model::{Kind, ManualPlan, Package, Role};
+pub use updates::Update;
