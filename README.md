@@ -1,4 +1,8 @@
-# Depot
+<p align="center">
+  <img src="docs/brand/logo-circle.png" alt="Depot logo: a pixel-art penguin in a yellow scarf, smiling, on a pink circle" width="128">
+</p>
+
+<h1 align="center">Depot</h1>
 
 **See every app on your Linux computer in one place. Keep them up to date, and remove the ones you don't need.**
 
