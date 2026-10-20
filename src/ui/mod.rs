@@ -11,11 +11,18 @@ use gtk::{gdk, gio, glib};
 use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
 
-/// A package plus precomputed keys, stored in the list model.
+/// One package of the shared inventory plus precomputed keys, stored in the list model.
 pub struct Item {
-    pub p: Package,
+    all: Rc<Vec<Package>>,
+    i: usize,
     search: String,
     sort: String,
+}
+
+impl Item {
+    pub fn p(&self) -> &Package {
+        &self.all[self.i]
+    }
 }
 
 pub fn item(o: &glib::Object) -> Ref<'_, Item> {
@@ -94,6 +101,9 @@ pub struct State {
     filtered: gtk::FilterListModel,
     stack: gtk::Stack,
     loading: Cell<bool>,
+    /// A scan is running; `rescan` asks for another once it's done instead of running two at once.
+    scanning: Cell<bool>,
+    rescan: Cell<bool>,
     rows: Vec<(gtk::ListBoxRow, Nav, gtk::Label)>,
     show_advanced: Cell<bool>,
     cat: Rc<Cell<usize>>,
@@ -132,7 +142,7 @@ pub fn activate(app: &adw::Application) {
         let (cat, query) = (cat.clone(), query.clone());
         gtk::CustomFilter::new(move |o| {
             let it = item(o);
-            (CATS[cat.get()].pred)(&it.p) && query.borrow().split_whitespace().all(|w| it.search.contains(w))
+            (CATS[cat.get()].pred)(it.p()) && query.borrow().split_whitespace().all(|w| it.search.contains(w))
         })
     };
     let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
@@ -230,7 +240,7 @@ pub fn activate(app: &adw::Application) {
     factory.connect_bind(|_, li| {
         let li = li.downcast_ref::<gtk::ListItem>().expect("ListItem");
         if let (Some(obj), Some(card)) = (li.item(), li.child()) {
-            widgets::bind_card(&card, &item(&obj).p);
+            widgets::bind_card(&card, item(&obj).p());
         }
     });
     let grid = gtk::GridView::builder()
@@ -291,6 +301,8 @@ pub fn activate(app: &adw::Application) {
         filtered: filtered.clone(),
         stack,
         loading: Cell::new(true),
+        scanning: Cell::new(false),
+        rescan: Cell::new(false),
         rows,
         show_advanced: Cell::new(false),
         cat,
@@ -370,7 +382,7 @@ pub fn activate(app: &adw::Application) {
         let st = st.clone();
         grid.connect_activate(move |g, pos| {
             if let Some(obj) = g.model().and_then(|m| m.item(pos)) {
-                let p = item(&obj).p.clone();
+                let p = item(&obj).p().clone();
                 detail::show(&st, p);
             }
         });
@@ -395,7 +407,7 @@ pub fn activate(app: &adw::Application) {
 
 fn sorter(mode: u32) -> gtk::CustomSorter {
     if mode == 1 {
-        gtk::CustomSorter::new(|a, b| item(b).p.size.cmp(&item(a).p.size).into())
+        gtk::CustomSorter::new(|a, b| item(b).p().size.cmp(&item(a).p().size).into())
     } else {
         gtk::CustomSorter::new(|a, b| item(a).sort.cmp(&item(b).sort).into())
     }
@@ -429,11 +441,21 @@ fn update_rows(st: &State) {
 }
 
 pub fn reload(st: &Rc<State>) {
+    if st.scanning.replace(true) {
+        st.rescan.set(true);
+        return;
+    }
     st.loading.set(true);
     st.stack.set_visible_child_name("loading");
     let st = st.clone();
     glib::spawn_future_local(async move {
         let inv = gio::spawn_blocking(|| depot_core::scan(&Env::system())).await.unwrap_or_default();
+        st.scanning.set(false);
+        if st.rescan.take() {
+            // something changed while this scan ran (e.g. an uninstall finished); read it again
+            reload(&st);
+            return;
+        }
         loaded(&st, inv);
     });
 }
@@ -453,19 +475,20 @@ fn update_counts(st: &State) {
 fn loaded(st: &Rc<State>, inv: Inventory) {
     let mut counts = vec![0usize; CATS.len()];
     st.unsupported.set_revealed(!inv.system_packages);
-    *st.packages.borrow_mut() = Rc::new(inv.packages.clone());
-    let items: Vec<glib::BoxedAnyObject> = inv
-        .packages
-        .into_iter()
-        .map(|p| {
+    let all = Rc::new(inv.packages);
+    *st.packages.borrow_mut() = all.clone();
+    let items: Vec<glib::BoxedAnyObject> = all
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
             for (i, c) in CATS.iter().enumerate() {
-                if (c.pred)(&p) {
+                if (c.pred)(p) {
                     counts[i] += 1;
                 }
             }
             let search = p.search_text();
             let sort = p.title.to_lowercase();
-            glib::BoxedAnyObject::new(Item { p, search, sort })
+            glib::BoxedAnyObject::new(Item { all: all.clone(), i, search, sort })
         })
         .collect();
     st.store.splice(0, st.store.n_items(), &items);
@@ -480,8 +503,11 @@ fn loaded(st: &Rc<State>, inv: Inventory) {
     for w in inv.warnings {
         st.toast(&w);
     }
-    // keep the Updates count current: in the background, without re-downloading package lists,
-    // or with them if the Updates page asked while the list was loading
-    let queued = st.updates.take_queued();
-    updates::check(st, queued.unwrap_or(false));
+    // keep the Updates count current. Asking the stores is slow and uses the network, so only
+    // when asked for or when the last answer is old; otherwise just drop what's no longer installed.
+    match st.updates.take_queued() {
+        Some(refresh) => updates::check(st, refresh),
+        None if st.updates.is_stale() => updates::check(st, false),
+        None => updates::prune(st),
+    }
 }

@@ -3,32 +3,15 @@
 use super::widgets::Progress;
 use super::{State, reload};
 use crate::packagekit::{self, PkPackage};
+use crate::system::{self, Outcome, home, short};
 use adw::prelude::*;
 use depot_core::backend::{dpkg, manual};
 use depot_core::remove::{self as removal, DebPlan};
 use depot_core::updates::info;
 use depot_core::{Kind, Package};
 use gtk::{gio, glib};
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-
-struct Outcome {
-    code: i32,
-    output: String,
-}
-
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
-}
-
-fn short(p: &Path) -> String {
-    let h = home();
-    match p.strip_prefix(&h) {
-        Ok(r) if !h.as_os_str().is_empty() => format!("~/{}", r.display()),
-        _ => p.display().to_string(),
-    }
-}
 
 /// Ask apt what removing this package would take with it, and what it would leave unused.
 fn simulate_apt(id: &str) -> DebPlan {
@@ -225,32 +208,13 @@ async fn trash_manual(p: &Package, with_data: bool) -> Outcome {
             errors.push(format!("{}: {}", short(t), e.message()));
         }
     }
-    Outcome { code: if errors.is_empty() { 0 } else { 1 }, output: errors.join("\n") }
-}
-
-fn privileged(cmd: Vec<String>, root: bool) -> Outcome {
-    let mut c = if root {
-        let mut c = Command::new("pkexec");
-        c.args(["env", "DEBIAN_FRONTEND=noninteractive", "LC_ALL=C.UTF-8"]).args(&cmd);
-        c
-    } else {
-        let mut c = Command::new(&cmd[0]);
-        c.args(&cmd[1..]);
-        c
-    };
-    match c.output() {
-        Ok(o) => Outcome {
-            code: o.status.code().unwrap_or(1),
-            output: format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
-        },
-        Err(e) => Outcome { code: 1, output: e.to_string() },
-    }
+    if errors.is_empty() { Outcome::ok() } else { Outcome::failed(errors.join("\n")) }
 }
 
 /// Remove exactly these packages (and what depends on them, which the user was shown).
 async fn remove_with_packagekit(ids: Vec<String>, progress: Rc<Progress>) -> Outcome {
     let r = packagekit::remove(&ids, false, false, move |pct, pkg: Option<&PkPackage>| {
-        let frac = (pct <= 100).then(|| pct as f64 / 100.0);
+        let frac = system::fraction(pct);
         match pkg {
             Some(k) if k.info == info::REMOVING => progress.set(&format!("Removing {}…", k.name()), frac),
             _ => progress.set("", frac),
@@ -258,9 +222,9 @@ async fn remove_with_packagekit(ids: Vec<String>, progress: Rc<Progress>) -> Out
     })
     .await;
     match r {
-        Ok(_) => Outcome { code: 0, output: String::new() },
+        Ok(_) => Outcome::ok(),
         Err(e) if e.cancelled => Outcome { code: 126, output: e.details },
-        Err(e) => Outcome { code: 1, output: e.details },
+        Err(e) => Outcome::failed(e.details),
     }
 }
 
@@ -307,9 +271,9 @@ fn run(
             let ids = std::iter::once(id).chain(orphan_pk_ids).collect();
             remove_with_packagekit(ids, progress.clone()).await
         } else {
-            gio::spawn_blocking(move || privileged(cmd, root))
+            gio::spawn_blocking(move || system::run(&cmd, root))
                 .await
-                .unwrap_or(Outcome { code: 1, output: "Crashed".into() })
+                .unwrap_or_else(|_| Outcome::failed("The uninstaller crashed."))
         };
         progress.close(opened).await;
         finish(&st, &p, r);
@@ -317,24 +281,18 @@ fn run(
 }
 
 fn finish(st: &Rc<State>, p: &Package, r: Outcome) {
-    match r.code {
-        0 => {
-            let what = if p.kind == Kind::Manual { "moved to the Trash" } else { "uninstalled" };
-            st.toast(&format!("{} was {what}", p.title));
-            st.nav.pop_to_page(&st.main_page);
-            reload(st);
-        }
-        126 | 127 => st.toast("Cancelled: authentication was not granted"),
-        code => {
-            let tail: Vec<&str> = r.output.trim().lines().rev().take(8).collect();
-            let body = if tail.is_empty() {
-                format!("Exit code {code}")
-            } else {
-                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-            };
-            let d = adw::AlertDialog::builder().heading("Uninstall failed").body(body).build();
-            d.add_response("close", "Close");
-            d.present(Some(&st.win));
-        }
+    if r.code == 0 {
+        let what = if p.kind == Kind::Manual { "moved to the Trash" } else { "uninstalled" };
+        st.toast(&format!("{} was {what}", p.title));
+        st.nav.pop_to_page(&st.main_page);
+        reload(st);
+    } else if r.cancelled() {
+        st.toast("Cancelled: authentication was not granted");
+    } else {
+        let tail = r.tail(8);
+        let body = if tail.is_empty() { format!("Exit code {}", r.code) } else { tail };
+        let d = adw::AlertDialog::builder().heading("Uninstall failed").body(body).build();
+        d.add_response("close", "Close");
+        d.present(Some(&st.win));
     }
 }

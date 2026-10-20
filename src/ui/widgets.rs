@@ -35,11 +35,15 @@ pub fn kind_badge(k: Kind) -> gtk::Label {
     pill(k.badge(), &format!("badge-{}", k.css()), k.explain())
 }
 
+fn broken_badge() -> gtk::Label {
+    pill("Broken", "badge-broken", "The program this launcher starts is no longer installed.")
+}
+
 /// Badges shown next to the source badge.
 pub fn extra_badges(p: &Package) -> Vec<gtk::Label> {
     let mut v = Vec::new();
     if p.broken {
-        v.push(pill("Broken", "badge-broken", "The program this launcher starts is no longer installed."));
+        v.push(broken_badge());
     }
     match p.role {
         Role::Tool if p.kind == Kind::Deb => v.push(pill("Library / tool", "badge-sys", "")),
@@ -83,6 +87,8 @@ pub struct Progress {
     status: gtk::Label,
     bar: gtk::ProgressBar,
     pulsing: Rc<Cell<bool>>,
+    /// Set once the dialog closes, which stops the pulse timer.
+    closed: Rc<Cell<bool>>,
 }
 
 impl Progress {
@@ -114,9 +120,10 @@ impl Progress {
         dialog.set_child(Some(&bx));
         dialog.present(Some(parent));
         let pulsing = Rc::new(Cell::new(true));
-        let (b, p) = (bar.clone(), pulsing.clone());
+        let closed = Rc::new(Cell::new(false));
+        let (b, p, c) = (bar.clone(), pulsing.clone(), closed.clone());
         glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
-            if !b.is_mapped() && !p.get() {
+            if c.get() {
                 return glib::ControlFlow::Break;
             }
             if p.get() {
@@ -124,7 +131,7 @@ impl Progress {
             }
             glib::ControlFlow::Continue
         });
-        Rc::new(Progress { dialog, status, bar, pulsing })
+        Rc::new(Progress { dialog, status, bar, pulsing, closed })
     }
 
     /// Update the status line (empty text keeps the old one) and the bar (`None` = unknown, pulse).
@@ -146,7 +153,7 @@ impl Progress {
         if let Some(wait) = std::time::Duration::from_millis(400).checked_sub(opened.elapsed()) {
             glib::timeout_future(wait).await;
         }
-        self.pulsing.set(false);
+        self.closed.set(true);
         self.dialog.force_close();
     }
 }
@@ -188,7 +195,7 @@ pub fn bind_card(card: &gtk::Widget, p: &Package) {
     }
     badges.append(&kind_badge(p.kind));
     if p.broken {
-        badges.append(&extra_badges(p)[0]);
+        badges.append(&broken_badge());
     }
     let size = size_text(p.size);
     if !size.is_empty() {

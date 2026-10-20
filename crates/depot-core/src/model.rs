@@ -124,10 +124,6 @@ impl Package {
         Package { kind, name: id.clone(), title: id.clone(), id, ..Default::default() }
     }
 
-    pub fn removable(&self) -> bool {
-        self.blocked.is_none()
-    }
-
     /// Lowercased text matched by search.
     pub fn search_text(&self) -> String {
         format!("{} {} {}", self.title, self.name, self.summary).to_lowercase()

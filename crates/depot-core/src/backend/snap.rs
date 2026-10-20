@@ -78,7 +78,12 @@ pub fn parse(v: &Value) -> Vec<Package> {
                 p.blocked = Some("This is a core snap that other snaps and snapd depend on.".into());
             } else if o.get("apps").and_then(Value::as_array).is_none_or(|a| a.is_empty()) {
                 // content snaps (themes, GPU drivers, GNOME platform) have no programs of their own
+                // and other snaps load files from them, so removing one can break those snaps
                 p.role = Role::Runtime;
+                p.blocked = Some(
+                    "Other snaps use this for shared themes, drivers or libraries, so removing it could break them."
+                        .into(),
+                );
             } else {
                 p.user_installed = true;
             }
@@ -130,7 +135,8 @@ mod tests {
         let p = super::parse(&v);
         assert!(p[0].blocked.is_some());
         assert_eq!(p[1].role, super::Role::Runtime);
-        assert!(p[1].blocked.is_none());
+        assert!(p[1].blocked.is_some(), "content snaps other snaps rely on aren't removable");
+        assert!(p[2].blocked.is_none());
         assert_eq!(p[2].title, "Spotify");
         assert_eq!(p[2].publisher, "Spotify ✔");
         assert_eq!(p[2].revision, "80");

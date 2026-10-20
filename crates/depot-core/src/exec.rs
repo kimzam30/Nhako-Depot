@@ -22,8 +22,22 @@ const WRAPPERS: &[&str] = &[
     "primusrun",
 ];
 
+/// Wrapper options whose value is the next argument (`env -u VAR`, `nice -n 10`, `ionice -c 3`).
+fn takes_value(wrapper: &str, opt: &str) -> bool {
+    let opts: &[&str] = match wrapper {
+        "env" => &["-u", "--unset", "-C", "--chdir"],
+        "nice" => &["-n", "--adjustment"],
+        "ionice" => &["-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"],
+        "sudo" => &["-u", "--user", "-g", "--group", "-D", "--chdir", "-p", "--prompt"],
+        "pkexec" => &["--user"],
+        _ => &[],
+    };
+    opts.contains(&opt)
+}
+
 /// Programs that run something else (interpreters, openers, containers). Owning one of
 /// these says nothing about who installed the launcher, so they never decide ownership.
+/// Anything starting with `python` or `java` counts too, see [`is_generic`].
 const GENERIC: &[&str] = &[
     "sh",
     "bash",
@@ -34,7 +48,6 @@ const GENERIC: &[&str] = &[
     "ruby",
     "node",
     "nodejs",
-    "java",
     "wine",
     "wine64",
     "mono",
@@ -90,9 +103,10 @@ fn is_generic(b: &str) -> bool {
 pub fn target(argv: &[String], search: &[PathBuf]) -> Option<Target> {
     let mut i = 0;
     while i < argv.len() && WRAPPERS.contains(&base(&argv[i])) {
+        let wrapper = base(&argv[i]);
         i += 1;
         while i < argv.len() && (argv[i].starts_with('-') || argv[i].contains('=')) {
-            i += 1;
+            i += if takes_value(wrapper, &argv[i]) { 2 } else { 1 };
         }
     }
     let prog = argv.get(i)?;
@@ -140,7 +154,9 @@ pub fn path_variants(p: &Path) -> Vec<PathBuf> {
     let mut extra = Vec::new();
     for q in &v {
         let s = q.to_string_lossy();
-        for (a, b) in [("/usr/bin/", "/bin/"), ("/usr/sbin/", "/sbin/"), ("/usr/lib/", "/lib/")] {
+        for (a, b) in
+            [("/usr/bin/", "/bin/"), ("/usr/sbin/", "/sbin/"), ("/usr/lib/", "/lib/"), ("/usr/lib64/", "/lib64/")]
+        {
             if let Some(r) = s.strip_prefix(a) {
                 extra.push(PathBuf::from(format!("{b}{r}")));
             } else if let Some(r) = s.strip_prefix(b) {
@@ -193,6 +209,10 @@ mod tests {
             Some(Target::Snap("code".into()))
         );
         assert_eq!(target(&a(&["snap", "run", "spotify"]), &[]), Some(Target::Snap("spotify".into())));
+        assert_eq!(
+            target(&a(&["env", "-u", "GTK_THEME", "nice", "-n", "5", "snap", "run", "x"]), &[]),
+            Some(Target::Snap("x".into()))
+        );
         match target(&a(&["pkexec", "python3", "/nonexistent/x.py"]), &[]) {
             Some(Target::Program { generic, .. }) => assert!(generic),
             t => panic!("{t:?}"),

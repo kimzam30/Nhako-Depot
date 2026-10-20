@@ -14,8 +14,9 @@ pub struct DesktopEntry {
     pub comment: String,
     /// Raw `Exec` value; use [`DesktopEntry::argv`] to split it.
     pub exec: String,
+    /// Program that must exist for the launcher to be shown.
+    pub try_exec: String,
     pub icon: String,
-    pub wm_class: String,
     pub is_application: bool,
     pub hidden: bool,
     pub no_display: bool,
@@ -102,8 +103,8 @@ impl DesktopEntry {
             }
             match key {
                 "Exec" => e.exec = v.to_string(),
+                "TryExec" => e.try_exec = unescape(v),
                 "Icon" => e.icon = unescape(v),
-                "StartupWMClass" => e.wm_class = v.to_string(),
                 "Type" => e.is_application = v == "Application",
                 "Hidden" => e.hidden = v == "true",
                 "NoDisplay" => e.no_display = v == "true",

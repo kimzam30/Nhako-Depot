@@ -3,7 +3,9 @@
 #
 #   ./install.sh               build (if possible) and install into ~/.local
 #   ./install.sh --uninstall   remove Depot
-#   PREFIX=/usr/local sudo -E ./install.sh   install for every user instead
+#
+# To install for every user instead, build as yourself first, then install as root:
+#   ./install.sh && sudo PREFIX=/usr/local ./install.sh
 set -eu
 
 APP_ID=dev.kimzam.Depot
@@ -27,7 +29,13 @@ if [ "${1:-}" = "--uninstall" ]; then
     exit 0
 fi
 
-if pkg-config --exists gtk4 libadwaita-1 2>/dev/null && command -v cargo >/dev/null 2>&1; then
+if [ "$(id -u)" = 0 ] && [ -x target/release/depot ]; then
+    # never build as root: it would leave root-owned files in target/
+    echo "Using the copy that's already built."
+elif [ "$(id -u)" = 0 ]; then
+    echo "Build Depot as yourself first (run ./install.sh without sudo), then run this again with sudo."
+    exit 1
+elif pkg-config --exists gtk4 libadwaita-1 2>/dev/null && command -v cargo >/dev/null 2>&1; then
     echo "Building Depot. The first build takes a minute or two…"
     cargo build --release --locked
 elif [ -x target/release/depot ]; then

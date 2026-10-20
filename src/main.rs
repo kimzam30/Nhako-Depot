@@ -1,4 +1,5 @@
 mod packagekit;
+mod system;
 mod ui;
 mod updates;
 

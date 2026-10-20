@@ -12,19 +12,29 @@
 
 ```sh
 cargo test -p depot-core          # fast; doesn't need GTK installed
-cargo clippy --workspace --all-targets -- -D warnings
+cargo run --release -p depot-core --example scan -- --summary   # the inventory, also without GTK
 cargo fmt --all
+```
+
+These need the GTK development files (`sudo apt install libgtk-4-dev libadwaita-1-dev`):
+
+```sh
+cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release               # the app
 cargo run --release -- --list-only | less
 ```
 
 ## Adding a new install type
 
-1. Add a variant to `Kind` in `crates/depot-core/src/model.rs`, with its badge, source text and explanation.
+1. Add a variant to `Kind` in `crates/depot-core/src/model.rs`, and fill in its `badge()`, `css()`,
+   `source()` and `explain()` texts.
 2. Add `crates/depot-core/src/backend/<name>.rs` with a `load()` that returns `Result<Vec<Package>, String>`.
    If the tool isn't installed, return `Ok(vec![])`, not an error. Keep the parsing in a separate
    `parse()` function so it can be unit-tested with sample output.
 3. Call it from `inventory::scan`, which runs backends in parallel, and teach `claim()` how to
    recognise that type's launchers.
 4. Add a `.badge-<name>` colour to `data/style.css`, then add the remove command in `src/ui/remove.rs`.
-5. Add a fixture test in `crates/depot-core/tests/inventory.rs`.
+   If it can remove other things along with the app, list them in the confirmation first.
+5. For updates, add a check function to the backend (like `snap::refreshable`), match its results in
+   `crates/depot-core/src/updates.rs`, and call it from `check()` and `apply()` in `src/updates.rs`.
+6. Add a fixture test in `crates/depot-core/tests/inventory.rs`.

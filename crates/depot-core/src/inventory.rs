@@ -250,8 +250,12 @@ pub fn scan(env: &Env) -> Inventory {
         pkgs.push(p);
     }
 
-    let shown: Vec<&Launcher> =
-        launchers.iter().filter(|l| l.entry.id != SELF_ID && l.entry.shown(&env.desktops)).collect();
+    // like the app menu, skip launchers whose TryExec program isn't installed
+    let shown: Vec<&Launcher> = launchers
+        .iter()
+        .filter(|l| l.entry.id != SELF_ID && l.entry.shown(&env.desktops))
+        .filter(|l| l.entry.try_exec.is_empty() || exec::resolve(&l.entry.try_exec, &env.path).is_some())
+        .collect();
     let mut icon_users: HashMap<String, usize> = HashMap::new();
     for l in &launchers {
         if !l.entry.icon.is_empty() {

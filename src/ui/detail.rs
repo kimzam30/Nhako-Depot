@@ -2,19 +2,12 @@
 
 use super::widgets::{self, label, wrapped};
 use super::{State, remove};
+use crate::system;
 use adw::prelude::*;
 use depot_core::backend::manual;
 use depot_core::{Kind, Package, Role};
 use gtk::{gio, glib};
 use std::rc::Rc;
-
-fn home_short(p: &std::path::Path) -> String {
-    let s = p.to_string_lossy();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => s.replacen(&h, "~", 1),
-        _ => s.into_owned(),
-    }
-}
 
 pub fn remove_label(p: &Package) -> &'static str {
     if p.broken {
@@ -105,10 +98,18 @@ pub fn show(st: &Rc<State>, p: Package) {
         r.add_css_class("property");
         r
     };
-    let mut rows: Vec<(&str, String)> = vec![("Source", p.kind.source().into()), ("Version", p.version.clone())];
     let size_row = row("Installed size", &widgets::size_text(p.size));
     let lazy_size = p.size == 0 && p.manual.as_ref().is_some_and(|m| m.appdir.is_some());
-    rows.push((if p.kind == Kind::Manual { "Launcher" } else { "Package name" }, p.id.clone()));
+    for (t, v) in [("Source", p.kind.source()), ("Version", p.version.as_str())] {
+        if !v.is_empty() {
+            grp.add(&row(t, v));
+        }
+    }
+    if p.size > 0 || lazy_size {
+        grp.add(&size_row);
+    }
+    let mut rows: Vec<(&str, String)> =
+        vec![(if p.kind == Kind::Manual { "Launcher" } else { "Package name" }, p.id.clone())];
     match p.kind {
         Kind::Snap => rows.extend([
             ("Publisher", p.publisher.clone()),
@@ -129,16 +130,13 @@ pub fn show(st: &Rc<State>, p: Package) {
             }
         }
     }
-    for (i, (t, v)) in rows.iter().enumerate() {
-        if i == 2 && (p.size > 0 || lazy_size) {
-            grp.add(&size_row);
-        }
+    for (t, v) in &rows {
         if !v.is_empty() {
             grp.add(&row(t, v));
         }
     }
     for l in &p.extra_launchers {
-        grp.add(&row("Also has launcher", &home_short(l)));
+        grp.add(&row("Also has launcher", &system::short(l)));
     }
     if !p.homepage.is_empty() {
         let r = adw::ActionRow::builder()

@@ -94,10 +94,13 @@ cargo run --release        # run the app
 
 | Path | What's there |
 | --- | --- |
-| `crates/depot-core` | Inventory engine with no GTK dependency: one backend per install type, launcher ownership, update matching, caching |
+| `crates/depot-core` | Inventory engine with no GTK dependency: one backend per install type, launcher ownership, update matching, removal planning, caching |
 | `src/packagekit.rs` | Small async PackageKit client over D-Bus |
+| `src/updates.rs` | Checking every source for updates and installing them |
+| `src/system.rs` | Running package-manager commands (with pkexec when needed) |
 | `src/ui` | GTK 4 / libadwaita interface |
 | `data/` | Stylesheet, launcher, icon |
+| `docs/` | The beginner's guide and the logo |
 
 Performance comes from reading package databases directly (no `dpkg-query` per package), loading
 all sources in parallel, and caching file-ownership lookups until the package database changes.

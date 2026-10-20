@@ -1,12 +1,12 @@
 //! Checking for and installing updates from every source at once.
 
 use crate::packagekit::{self, PkPackage};
+use crate::system;
 use depot_core::backend::{flatpak, snap};
 use depot_core::{Kind, Package, Update, updates};
 use gtk::gio;
 use serde::Serialize;
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Checked {
@@ -74,30 +74,11 @@ pub async fn removals(ids: &[String]) -> Vec<String> {
     }
 }
 
-fn cli(cmd: Vec<String>, root: bool) -> Result<(), (i32, String)> {
-    let mut c = if root { Command::new("pkexec") } else { Command::new(&cmd[0]) };
-    if root {
-        c.args(["env", "DEBIAN_FRONTEND=noninteractive", "LC_ALL=C.UTF-8"]).args(&cmd);
-    } else {
-        c.args(&cmd[1..]);
-    }
-    match c.output() {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => {
-            let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-            let tail: Vec<&str> = text.trim().lines().rev().take(6).collect();
-            Err((o.status.code().unwrap_or(1), tail.into_iter().rev().collect::<Vec<_>>().join("\n")))
-        }
-        Err(e) => Err((1, e.to_string())),
-    }
-}
-
 async fn blocking(cmd: Vec<String>, root: bool) -> Result<(), Done> {
-    match gio::spawn_blocking(move || cli(cmd, root)).await {
-        Ok(Ok(())) => Ok(()),
-        // pkexec: 126 = dismissed, 127 = not authorised
-        Ok(Err((126 | 127, _))) => Err(Done::Cancelled),
-        Ok(Err((_, msg))) => Err(Done::Failed(msg)),
+    match gio::spawn_blocking(move || system::run(&cmd, root)).await {
+        Ok(o) if o.code == 0 => Ok(()),
+        Ok(o) if o.cancelled() => Err(Done::Cancelled),
+        Ok(o) => Err(Done::Failed(o.tail(6))),
         Err(_) => Err(Done::Failed("The updater crashed.".into())),
     }
 }
@@ -108,31 +89,20 @@ pub async fn apply(list: &[Update], status: impl Fn(&str, Option<f64>) + Clone +
     let snaps: Vec<String> = list.iter().filter(|u| u.kind == Kind::Snap).map(|u| u.id.clone()).collect();
     let flats: Vec<&Update> = list.iter().filter(|u| u.kind == Kind::Flatpak).collect();
 
+    // native updates only ever come from PackageKit (see `check`), so it does the installing too
     if !debs.is_empty() {
-        if packagekit::available().await {
-            let ids: Vec<String> = debs.iter().map(|u| u.id.clone()).collect();
-            let s = status.clone();
-            s("Preparing system updates…", None);
-            let r = packagekit::update(&ids, false, move |pct, pkg: Option<&PkPackage>| {
-                let frac = (pct <= 100).then(|| pct as f64 / 100.0);
-                match pkg {
-                    Some(p) => s(&format!("Updating {}…", p.name()), frac),
-                    None => s("", frac),
-                }
-            })
-            .await;
-            match r {
-                Ok(_) => {}
-                Err(e) if e.cancelled => return Done::Cancelled,
-                Err(e) => return Done::Failed(e.details),
-            }
-        } else {
-            status("Updating system packages…", None);
-            let mut cmd = vec!["apt-get".to_string(), "install".into(), "--only-upgrade".into(), "-y".into()];
-            cmd.extend(debs.iter().map(|u| u.name.clone()));
-            if let Err(d) = blocking(cmd, true).await {
-                return d;
-            }
+        let ids: Vec<String> = debs.iter().map(|u| u.id.clone()).collect();
+        let s = status.clone();
+        s("Preparing system updates…", None);
+        let r = packagekit::update(&ids, false, move |pct, pkg: Option<&PkPackage>| match pkg {
+            Some(p) => s(&format!("Updating {}…", p.name()), system::fraction(pct)),
+            None => s("", system::fraction(pct)),
+        })
+        .await;
+        match r {
+            Ok(_) => {}
+            Err(e) if e.cancelled => return Done::Cancelled,
+            Err(e) => return Done::Failed(e.details),
         }
     }
     if !snaps.is_empty() {
@@ -143,15 +113,15 @@ pub async fn apply(list: &[Update], status: impl Fn(&str, Option<f64>) + Clone +
             return d;
         }
     }
-    for system in [true, false] {
-        let refs: Vec<String> = flats.iter().filter(|u| u.system == system).map(|u| u.id.clone()).collect();
+    for system_wide in [true, false] {
+        let refs: Vec<String> = flats.iter().filter(|u| u.system == system_wide).map(|u| u.id.clone()).collect();
         if refs.is_empty() {
             continue;
         }
         status(&format!("Updating {} Flatpak item(s)…", refs.len()), None);
         // Flatpak asks polkit itself for system-wide installs, so no pkexec here
         let mut cmd: Vec<String> =
-            ["flatpak", "update", "-y", "--noninteractive", if system { "--system" } else { "--user" }]
+            ["flatpak", "update", "-y", "--noninteractive", if system_wide { "--system" } else { "--user" }]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();

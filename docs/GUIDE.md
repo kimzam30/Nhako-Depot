@@ -68,8 +68,10 @@ computer needs to work, such as the core of the system or the runtimes that Flat
 3. Click **Uninstall**. If your computer asks for your password, type it. That's your system
    checking it's really you, not Depot.
 
-For apps installed by hand, the button says **Move to Trash**. The files go to your Trash, so if you
-change your mind you can open the Trash and restore them.
+For apps installed by hand, Depot lists the files it found and the confirm button says **Move to
+Trash**. The files go to your Trash, so if you change your mind you can open the Trash and restore
+them. If Depot only found the app's menu entry, the button on its page says **Remove launcher** and
+the program itself is left alone.
 
 If Depot says **"Your system needs this package to work"**, it has refused to remove something
 that would break your computer. That's on purpose.

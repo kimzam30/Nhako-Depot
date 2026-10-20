@@ -23,13 +23,9 @@ pub struct Update {
     pub system: bool,
 }
 
-/// PackageKit's `Info` values that mean "an update of this kind is available".
+/// The PackageKit `Info` values Depot looks at.
 pub mod info {
-    pub const LOW: u32 = 3;
-    pub const ENHANCEMENT: u32 = 4;
     pub const NORMAL: u32 = 5;
-    pub const BUGFIX: u32 = 6;
-    pub const IMPORTANT: u32 = 7;
     pub const SECURITY: u32 = 8;
     pub const BLOCKED: u32 = 9;
     pub const REMOVING: u32 = 13;
@@ -115,6 +111,12 @@ pub fn from_flatpaks(ups: &[FlatpakUpdate], inv: &[Package]) -> Vec<Update> {
         .collect()
 }
 
+/// Drop updates for software that's no longer installed, so the list stays right after an
+/// uninstall without asking every store again.
+pub fn retain_installed(ups: &mut Vec<Update>, inv: &[Package]) {
+    ups.retain(|u| inv.iter().any(|p| p.kind == u.kind && p.name == u.name));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +173,17 @@ mod tests {
         assert_eq!(u[0].title, "Discord", "matched to the system-wide copy being updated");
         assert_eq!(u[0].role, Role::App);
         assert_eq!(u[1].role, Role::Runtime);
+    }
+
+    #[test]
+    fn updates_of_removed_software_are_dropped() {
+        let inv = vec![deb("firefox", "Firefox", "1.0", Role::App)];
+        let arch = dpkg::native_arch();
+        let pk = vec![(info::NORMAL, format!("firefox;2.0;{arch};x")), (info::NORMAL, format!("gone;2;{arch};x"))];
+        let mut u = from_packagekit(&pk, &inv);
+        retain_installed(&mut u, &inv);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].name, "firefox");
     }
 
     #[test]

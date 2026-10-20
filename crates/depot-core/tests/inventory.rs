@@ -281,3 +281,14 @@ fn data_folders_need_the_apps_own_name() {
     assert!(data("Icons").is_empty(), "the shared icons folder is never an app's data");
     assert!(data("Fancy").is_empty(), "a launcher name that isn't the app's own name doesn't pick folders");
 }
+
+#[test]
+fn launcher_with_missing_tryexec_is_skipped() {
+    let f = Fake::new("tryexec");
+    let bin = f.exe("usr/bin/real");
+    f.launcher("usr/share/applications/gone.desktop", "Name=Gone\nTryExec=not-installed\nExec=not-installed");
+    f.launcher("usr/share/applications/here.desktop", &format!("Name=Here\nTryExec=real\nExec={}", bin.display()));
+    let inv = scan(&f.env());
+    assert!(find(&inv.packages, "Gone").is_empty(), "the app menu hides it, so Depot does too");
+    assert_eq!(find(&inv.packages, "Here").len(), 1);
+}

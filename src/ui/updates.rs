@@ -19,6 +19,8 @@ pub struct View {
     groups: RefCell<Vec<adw::PreferencesGroup>>,
     pub update_all: gtk::Button,
     pending: RefCell<Vec<Update>>,
+    /// Sources the last check couldn't reach.
+    warnings: RefCell<Vec<String>>,
     checked_at: Cell<Option<Instant>>,
     /// A check is running.
     checking: Cell<bool>,
@@ -60,6 +62,7 @@ impl View {
             groups: RefCell::new(Vec::new()),
             update_all,
             pending: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
             checked_at: Cell::new(None),
             checking: Cell::new(false),
             installing: Cell::new(false),
@@ -78,6 +81,11 @@ impl View {
 
     pub fn take_queued(&self) -> Option<bool> {
         self.queued.take()
+    }
+
+    /// Ask for a check to run as soon as possible (`true` = with fresh package lists).
+    fn queue(&self, refresh: bool) {
+        self.queued.set(Some(refresh || self.queued.get().unwrap_or(false)));
     }
 
     pub fn is_stale(&self) -> bool {
@@ -110,8 +118,9 @@ fn update_button(st: &Rc<State>, list: Vec<Update>) -> gtk::Button {
     b
 }
 
-fn render(st: &Rc<State>, warnings: &[String]) {
+fn render(st: &Rc<State>) {
     let v = &st.updates;
+    let warnings = v.warnings.borrow();
     for g in v.groups.borrow_mut().drain(..) {
         v.page.remove(&g);
     }
@@ -184,7 +193,7 @@ fn render(st: &Rc<State>, warnings: &[String]) {
             .title("Couldn't check everything")
             .description("Check your internet connection, then press Refresh.")
             .build();
-        for w in warnings {
+        for w in warnings.iter() {
             let row = adw::ActionRow::builder().title(glib::markup_escape_text(w)).build();
             row.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
             grp.add(&row);
@@ -206,7 +215,7 @@ pub fn check(st: &Rc<State>, refresh: bool) {
     let v = &st.updates;
     // updates are matched against the installed list, so wait for it; never drop a request
     if v.checking.get() || v.installing.get() || st.loading.get() {
-        v.queued.set(Some(refresh || v.queued.get().unwrap_or(false)));
+        v.queue(refresh);
         // keep showing the list while updates install; the queued check replaces it afterwards
         if refresh && !v.installing.get() {
             v.root.set_visible_child_name("checking");
@@ -223,14 +232,27 @@ pub fn check(st: &Rc<State>, refresh: bool) {
         let checked = updates::check(refresh, &inv).await;
         let v = &st.updates;
         *v.pending.borrow_mut() = checked.updates;
+        *v.warnings.borrow_mut() = checked.warnings;
         v.checked_at.set(Some(Instant::now()));
         v.checking.set(false);
-        render(&st, &checked.warnings);
+        render(&st);
         super::update_counts(&st);
         if let Some(refresh) = v.queued.take() {
             check(&st, refresh);
         }
     });
+}
+
+/// After the installed list was re-read without a new check: drop updates of removed software.
+pub fn prune(st: &Rc<State>) {
+    // a running check renders its own fresh answer
+    if st.updates.checking.get() {
+        return;
+    }
+    let inv = st.packages.borrow().clone();
+    depot_core::updates::retain_installed(&mut st.updates.pending.borrow_mut(), &inv);
+    render(st);
+    super::update_counts(st);
 }
 
 /// Install updates, after a dry run shows whether anything would be removed along the way.
@@ -265,7 +287,8 @@ pub fn run(st: &Rc<State>, list: Vec<Update>) {
         match done {
             Done::Ok => {
                 st.toast(if n == 1 { "Update installed" } else { "Updates installed" });
-                // reloading checks again afterwards, including any check queued meanwhile
+                // reloading checks again afterwards, merged with any check queued meanwhile
+                st.updates.queue(false);
                 reload(&st);
             }
             Done::Cancelled => {
