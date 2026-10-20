@@ -59,6 +59,9 @@ pub struct Inventory {
     pub packages: Vec<Package>,
     /// Sources that couldn't be read, in plain language.
     pub warnings: Vec<String>,
+    /// The system's own package database was found. When it wasn't (a distro Depot can't read
+    /// yet, such as Fedora or Arch), system apps can't be told apart from manual installs.
+    pub system_packages: bool,
 }
 
 /// How a launcher was matched to its package.
@@ -114,6 +117,12 @@ fn claim(l: &Launcher, env: &Env) -> Claim {
     Claim::Files(files, program, missing)
 }
 
+/// Whether launcher id `id` is an extra launcher of the Flatpak app `app` (`org.x.App.Tool` is,
+/// `org.x.AppTwo` isn't).
+fn flatpak_child(id: &str, app: &str) -> bool {
+    id.strip_prefix(app).is_some_and(|r| r.starts_with('.'))
+}
+
 fn attach(p: &mut Package, l: &Launcher) {
     let e = &l.entry;
     if p.desktop.is_some() {
@@ -142,6 +151,7 @@ fn manual_package(
     program: Option<&Path>,
     env: &Env,
     icon_users: &HashMap<String, usize>,
+    programs: &[PathBuf],
     web: bool,
     broken: bool,
 ) -> Package {
@@ -170,7 +180,7 @@ fn manual_package(
         p.blocked = Some("This is a web app made by your browser. Remove it from the browser's own apps page.".into());
         return p;
     }
-    let plan = manual::plan(e, program, &env.home, icon_users);
+    let plan = manual::plan(e, program, &env.home, icon_users, programs);
     p.location = match (&plan.appdir, program) {
         (Some(d), _) => d.to_string_lossy().into_owned(),
         (None, Some(prog)) => prog.to_string_lossy().into_owned(),
@@ -202,7 +212,7 @@ pub fn scan(env: &Env) -> Inventory {
         (join(d), join(sn), join(f), l)
     });
 
-    let mut inv = Inventory::default();
+    let mut inv = Inventory { system_packages: env.dpkg_dir.join("status").exists(), ..Default::default() };
     let mut take = |r: Result<Vec<Package>, String>, what: &str| match r {
         Ok(v) => v,
         Err(e) => {
@@ -277,11 +287,7 @@ pub fn scan(env: &Env) -> Inventory {
             },
             Claim::Flatpak(id) => {
                 let hit = flat_ix.get(id).or_else(|| {
-                    flat_ix
-                        .iter()
-                        .filter(|(k, _)| id.starts_with(k.as_str()))
-                        .max_by_key(|(k, _)| k.len())
-                        .map(|(_, i)| i)
+                    flat_ix.iter().filter(|(k, _)| flatpak_child(id, k)).max_by_key(|(k, _)| k.len()).map(|(_, i)| i)
                 });
                 match hit {
                     Some(&i) => attach(&mut pkgs[i], l),
@@ -298,6 +304,13 @@ pub fn scan(env: &Env) -> Inventory {
             }
         }
     }
+    // programs of hand-installed launchers, so one app's folder is never mistaken for a shared one
+    let programs: Vec<PathBuf> = claims
+        .iter()
+        .filter_map(|c| if let Claim::Files(_, Some(p), _) = c { Some(p) } else { None })
+        .filter(|p| p.starts_with(&env.home))
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
     for (l, files, web, broken) in deferred {
         if let Some((files, program)) = files {
             let by_exec = files.iter().find_map(|(p, _)| owners.get(p)).and_then(|o| deb_ix.get(o));
@@ -305,9 +318,9 @@ pub fn scan(env: &Env) -> Inventory {
                 attach(&mut pkgs[i], l);
                 continue;
             }
-            pkgs.push(manual_package(l, program, env, &icon_users, false, broken));
+            pkgs.push(manual_package(l, program, env, &icon_users, &programs, false, broken));
         } else {
-            pkgs.push(manual_package(l, None, env, &icon_users, web, broken));
+            pkgs.push(manual_package(l, None, env, &icon_users, &programs, web, broken));
         }
     }
 
@@ -325,7 +338,26 @@ pub fn scan(env: &Env) -> Inventory {
             }
         }
     }
+    // the same ref installed both for everyone and for this user would otherwise be two identical cards
+    let mut flat_refs: HashMap<&str, usize> = HashMap::new();
+    for p in pkgs.iter().filter(|p| p.kind == Kind::Flatpak) {
+        *flat_refs.entry(p.id.as_str()).or_default() += 1;
+    }
+    let twice: HashSet<String> = flat_refs.into_iter().filter(|(_, n)| *n > 1).map(|(id, _)| id.to_string()).collect();
+    for p in pkgs.iter_mut().filter(|p| p.kind == Kind::Flatpak && twice.contains(&p.id)) {
+        p.title = format!("{} ({})", p.title, if p.system { "all users" } else { "only you" });
+    }
     pkgs.sort_by_cached_key(|p| p.title.to_lowercase());
     inv.packages = pkgs;
     inv
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn flatpak_child_needs_a_name_boundary() {
+        assert!(super::flatpak_child("org.x.App.Tool", "org.x.App"));
+        assert!(!super::flatpak_child("org.x.AppTwo", "org.x.App"));
+        assert!(!super::flatpak_child("org.x.App", "org.x.App"));
+    }
 }

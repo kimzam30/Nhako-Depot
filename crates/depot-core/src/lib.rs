@@ -6,6 +6,7 @@ pub mod desktop;
 pub mod exec;
 pub mod inventory;
 pub mod model;
+pub mod remove;
 pub mod updates;
 pub mod xdg;
 

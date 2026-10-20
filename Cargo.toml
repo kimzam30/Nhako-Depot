@@ -31,5 +31,5 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# no panic = "abort": a crashing source loader must become a warning, not close the app
 strip = true

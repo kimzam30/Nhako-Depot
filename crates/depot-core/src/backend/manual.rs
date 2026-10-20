@@ -14,16 +14,73 @@ pub fn app_roots(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The app's own folder: `<root>/<first component>` for a program living under one of the roots.
-pub fn appdir(program: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+/// Sub-folders that are part of one app's layout, never an app of their own.
+const LAYOUT_DIRS: &[&str] = &["bin", "lib", "lib64", "libexec", "share", "resources", "usr", "opt"];
+
+/// Whether `dir` only groups several apps (e.g. `~/Applications/tools/{a,b}`) rather than being
+/// one app's folder: it holds no files of its own, and another launcher's program lives in a
+/// different sub-folder than this program's.
+fn groups_apps(dir: &Path, program: &Path, others: &[PathBuf]) -> bool {
+    let Some(child) = program.strip_prefix(dir).ok().and_then(|r| r.components().next()) else { return false };
+    let child = dir.join(child);
+    let layout = child.file_name().and_then(|n| n.to_str()).is_some_and(|n| LAYOUT_DIRS.contains(&n));
+    if layout || !child.is_dir() {
+        return false;
+    }
+    let other_app = others.iter().any(|o| o.starts_with(dir) && !o.starts_with(&child));
+    let has_files =
+        std::fs::read_dir(dir).map(|rd| rd.flatten().any(|e| e.file_type().is_ok_and(|t| !t.is_dir()))).unwrap_or(true);
+    other_app && !has_files
+}
+
+/// The app's own folder under one of the roots: the first folder below the root that holds the
+/// program and isn't just a group of several apps. `others` are the (resolved) programs of
+/// every other launcher, so a shared folder is never taken for one app's.
+pub fn appdir(program: &Path, roots: &[PathBuf], others: &[PathBuf]) -> Option<PathBuf> {
     let real = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
     roots.iter().find_map(|root| {
         let rest = real.strip_prefix(root).ok()?;
-        let first = rest.components().next()?;
-        let dir = root.join(first);
-        (dir != *root && dir.is_dir()).then_some(dir)
+        let comps: Vec<_> = rest.components().collect();
+        let mut dir = root.clone();
+        // the last component is the program file itself
+        for c in &comps[..comps.len().saturating_sub(1)] {
+            dir.push(c);
+            if !groups_apps(&dir, &real, others) {
+                return dir.is_dir().then_some(dir);
+            }
+        }
+        None
     })
 }
+
+/// Folder names in `~/.local/share`, `~/.config` and `~/.cache` that belong to the desktop or to
+/// many apps, never to one manual install.
+const SHARED_DATA: &[&str] = &[
+    "applications",
+    "icons",
+    "fonts",
+    "mime",
+    "themes",
+    "autostart",
+    "bin",
+    "systemd",
+    "flatpak",
+    "Trash",
+    "keyrings",
+    "menus",
+    "desktop-directories",
+    "metainfo",
+    "gnome-shell",
+    "dconf",
+    "pulse",
+    "fontconfig",
+    "environment.d",
+    "gtk-3.0",
+    "gtk-4.0",
+    "nautilus",
+    "user-places.xbel",
+    "recently-used.xbel",
+];
 
 /// True if `text` mentions `dir` as a whole path (so `/opt/foo` doesn't match `/opt/foobar`).
 fn mentions(text: &str, dir: &str) -> bool {
@@ -34,14 +91,16 @@ fn mentions(text: &str, dir: &str) -> bool {
 
 /// Work out exactly which files belong to a manual install.
 /// `icon_users` counts how many launchers use each icon name, so shared icons are never removed.
+/// `others` are the resolved programs of every other launcher (see [`appdir`]).
 pub fn plan(
     entry: &DesktopEntry,
     program: Option<&Path>,
     home: &Path,
     icon_users: &HashMap<String, usize>,
+    others: &[PathBuf],
 ) -> ManualPlan {
     let roots = app_roots(home);
-    let appdir = program.and_then(|p| appdir(p, &roots));
+    let appdir = program.and_then(|p| appdir(p, &roots, others));
     let mut files = vec![entry.path.clone()];
     let mut data = Vec::new();
     if let Some(dir) = &appdir {
@@ -75,7 +134,11 @@ pub fn plan(
         if !icon.is_empty() && !icon.contains('/') && icon_users.get(icon).copied().unwrap_or(0) <= 1 {
             find_icons(&home.join(".local/share/icons"), icon, 0, &mut files);
         }
-        if base.len() >= 3 {
+        // settings folders are only guessed when the launcher's name is the app's own name
+        let lower = base.to_lowercase();
+        let named = |p: Option<&std::ffi::OsStr>| p.and_then(|n| n.to_str()).is_some_and(|n| n.to_lowercase() == lower);
+        let own_name = named(dir.file_name()) || named(program.and_then(Path::file_stem));
+        if base.len() >= 3 && own_name && !SHARED_DATA.iter().any(|s| s.eq_ignore_ascii_case(base)) {
             for d in [".local/share", ".config", ".cache"] {
                 let p = home.join(d).join(base);
                 if p.exists() {

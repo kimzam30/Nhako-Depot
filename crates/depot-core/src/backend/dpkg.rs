@@ -21,7 +21,7 @@ pub fn native_arch() -> &'static str {
 }
 
 /// The name apt and dpkg accept for a package: bare for native and `all`, `name:arch` otherwise.
-fn pkg_id(name: &str, arch: &str) -> String {
+pub fn pkg_id(name: &str, arch: &str) -> String {
     if arch.is_empty() || arch == "all" || arch == native_arch() { name.to_string() } else { format!("{name}:{arch}") }
 }
 

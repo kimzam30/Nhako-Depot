@@ -97,10 +97,14 @@ pub fn from_snaps(refresh: &[(String, String)], inv: &[Package]) -> Vec<Update> 
 }
 
 pub fn from_flatpaks(ups: &[FlatpakUpdate], inv: &[Package]) -> Vec<Update> {
-    let flats = index(inv, Kind::Flatpak);
+    // a ref can be installed both system-wide and per user; match the installation being updated
+    let mut flats: HashMap<(&str, bool), &Package> = HashMap::new();
+    for p in inv.iter().filter(|p| p.kind == Kind::Flatpak) {
+        flats.entry((p.id.as_str(), p.system)).or_insert(p);
+    }
     ups.iter()
         .map(|f| {
-            let p = flats.get(f.r#ref.as_str()).copied();
+            let p = flats.get(&(f.r#ref.as_str(), f.system)).copied();
             let mut u = from_installed(Kind::Flatpak, f.r#ref.clone(), &f.appid, f.version.clone(), p);
             if f.runtime {
                 u.role = Role::Runtime;
@@ -160,8 +164,11 @@ mod tests {
                 system: false,
             },
         ];
-        let u = from_flatpaks(&ups, &[app]);
-        assert_eq!(u[0].title, "Discord");
+        let mut user_copy = app.clone();
+        user_copy.title = "Discord (only you)".into();
+        app.system = true;
+        let u = from_flatpaks(&ups, &[user_copy, app]);
+        assert_eq!(u[0].title, "Discord", "matched to the system-wide copy being updated");
         assert_eq!(u[0].role, Role::App);
         assert_eq!(u[1].role, Role::Runtime);
     }

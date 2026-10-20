@@ -20,9 +20,13 @@ pub struct View {
     pub update_all: gtk::Button,
     pending: RefCell<Vec<Update>>,
     checked_at: Cell<Option<Instant>>,
-    busy: Cell<bool>,
-    /// A check asked for while another was running or before the installed list was read
-    /// (`true` = with fresh package lists). It runs as soon as possible instead of being dropped.
+    /// A check is running.
+    checking: Cell<bool>,
+    /// Updates are being installed; the Update buttons are disabled meanwhile.
+    installing: Cell<bool>,
+    /// A check asked for while another was running, during an install, or before the installed
+    /// list was read (`true` = with fresh package lists). It runs as soon as possible instead of
+    /// being dropped.
     queued: Cell<Option<bool>>,
 }
 
@@ -57,7 +61,8 @@ impl View {
             update_all,
             pending: RefCell::new(Vec::new()),
             checked_at: Cell::new(None),
-            busy: Cell::new(false),
+            checking: Cell::new(false),
+            installing: Cell::new(false),
             queued: Cell::new(None),
         }
     }
@@ -117,7 +122,8 @@ fn render(st: &Rc<State>, warnings: &[String]) {
     let pending = v.pending.borrow();
     let on_updates = st.view.visible_child_name().as_deref() == Some("updates");
     v.update_all.set_visible(on_updates && !pending.is_empty());
-    v.update_all.set_sensitive(!v.busy.get());
+    v.update_all.set_sensitive(!v.installing.get());
+    v.page.set_sensitive(!v.installing.get());
 
     let apps: Vec<&Update> = pending.iter().filter(|u| u.role == Role::App).collect();
     if !apps.is_empty() {
@@ -199,14 +205,15 @@ fn security_badge() -> gtk::Label {
 pub fn check(st: &Rc<State>, refresh: bool) {
     let v = &st.updates;
     // updates are matched against the installed list, so wait for it; never drop a request
-    if v.busy.get() || st.loading.get() {
+    if v.checking.get() || v.installing.get() || st.loading.get() {
         v.queued.set(Some(refresh || v.queued.get().unwrap_or(false)));
-        if refresh {
+        // keep showing the list while updates install; the queued check replaces it afterwards
+        if refresh && !v.installing.get() {
             v.root.set_visible_child_name("checking");
         }
         return;
     }
-    v.busy.set(true);
+    v.checking.set(true);
     if refresh || v.checked_at.get().is_none() {
         v.root.set_visible_child_name("checking");
     }
@@ -217,7 +224,7 @@ pub fn check(st: &Rc<State>, refresh: bool) {
         let v = &st.updates;
         *v.pending.borrow_mut() = checked.updates;
         v.checked_at.set(Some(Instant::now()));
-        v.busy.set(false);
+        v.checking.set(false);
         render(&st, &checked.warnings);
         super::update_counts(&st);
         if let Some(refresh) = v.queued.take() {
@@ -228,17 +235,18 @@ pub fn check(st: &Rc<State>, refresh: bool) {
 
 /// Install updates, after a dry run shows whether anything would be removed along the way.
 pub fn run(st: &Rc<State>, list: Vec<Update>) {
-    if st.updates.busy.replace(true) {
+    // the buttons are disabled while installing, so this only guards against a double click
+    if st.updates.installing.replace(true) {
         return;
     }
-    st.updates.update_all.set_sensitive(false);
+    set_installing(st, true);
     let st = st.clone();
     glib::spawn_future_local(async move {
         let deb_ids: Vec<String> = list.iter().filter(|u| u.kind == Kind::Deb).map(|u| u.id.clone()).collect();
         let removed = if deb_ids.is_empty() { Vec::new() } else { updates::removals(&deb_ids).await };
         if !removed.is_empty() && !confirm_removals(&st, &removed).await {
-            st.updates.busy.set(false);
-            st.updates.update_all.set_sensitive(true);
+            set_installing(&st, false);
+            run_queued(&st);
             return;
         }
         let n = list.len();
@@ -253,24 +261,40 @@ pub fn run(st: &Rc<State>, list: Vec<Update>) {
         let p = progress.clone();
         let done = updates::apply(&list, move |text, frac| p.set(text, frac)).await;
         progress.close(opened).await;
-        st.updates.busy.set(false);
+        set_installing(&st, false);
         match done {
             Done::Ok => {
                 st.toast(if n == 1 { "Update installed" } else { "Updates installed" });
+                // reloading checks again afterwards, including any check queued meanwhile
                 reload(&st);
             }
             Done::Cancelled => {
                 st.toast("Cancelled: authentication was not granted");
-                st.updates.update_all.set_sensitive(true);
+                run_queued(&st);
             }
             Done::Failed(msg) => {
                 let d = adw::AlertDialog::builder().heading("Update failed").body(msg).build();
                 d.add_response("close", "Close");
                 d.present(Some(&st.win));
-                check(&st, false);
+                let refresh = st.updates.take_queued().unwrap_or(false);
+                check(&st, refresh);
             }
         }
     });
+}
+
+fn set_installing(st: &State, on: bool) {
+    let v = &st.updates;
+    v.installing.set(on);
+    v.update_all.set_sensitive(!on);
+    v.page.set_sensitive(!on);
+}
+
+/// Run a check that was asked for while updates were being installed.
+fn run_queued(st: &Rc<State>) {
+    if let Some(refresh) = st.updates.take_queued() {
+        check(st, refresh);
+    }
 }
 
 async fn confirm_removals(st: &State, removed: &[String]) -> bool {

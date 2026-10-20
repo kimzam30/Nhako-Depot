@@ -238,4 +238,46 @@ fn missing_package_managers_are_not_errors() {
     let inv = scan(&f.env());
     assert!(inv.packages.is_empty());
     assert!(inv.warnings.is_empty());
+    assert!(!inv.system_packages, "no dpkg database means the distro isn't supported yet");
+    f.deb("x", &[]);
+    assert!(scan(&f.env()).system_packages);
+}
+
+/// A folder that only groups several apps is never planned for removal as one app's folder.
+#[test]
+fn shared_folder_is_not_one_apps_folder() {
+    let f = Fake::new("shared");
+    let a = f.exe("home/Applications/tools/a/a");
+    let b = f.exe("home/Applications/tools/b/b");
+    f.launcher("home/.local/share/applications/a.desktop", &format!("Name=A\nExec={}", a.display()));
+    f.launcher("home/.local/share/applications/b.desktop", &format!("Name=B\nExec={}", b.display()));
+    // one app with a helper in its own lib/ folder is still one app
+    let foo = f.exe("home/.local/opt/foo/bin/foo");
+    let helper = f.exe("home/.local/opt/foo/lib/helper");
+    f.launcher("home/.local/share/applications/foo.desktop", &format!("Name=Foo\nExec={}", foo.display()));
+    f.launcher("home/.local/share/applications/foo-helper.desktop", &format!("Name=Helper\nExec={}", helper.display()));
+
+    let inv = scan(&f.env());
+    let dir = |title: &str| find(&inv.packages, title)[0].manual.as_ref().unwrap().appdir.clone();
+    assert_eq!(dir("A"), Some(f.p("home/Applications/tools/a")));
+    assert_eq!(dir("B"), Some(f.p("home/Applications/tools/b")));
+    assert_eq!(dir("Foo"), Some(f.p("home/.local/opt/foo")));
+    assert_eq!(dir("Helper"), Some(f.p("home/.local/opt/foo")));
+}
+
+/// Settings folders are only offered when they carry the app's own name, and never shared ones.
+#[test]
+fn data_folders_need_the_apps_own_name() {
+    let f = Fake::new("data");
+    let icons = f.exe("home/.local/opt/icons/bin/icons");
+    f.launcher("home/.local/share/applications/icons.desktop", &format!("Name=Icons\nExec={}", icons.display()));
+    let tool = f.exe("home/.local/opt/tool-2.0/tool");
+    f.launcher("home/.local/share/applications/fancy.desktop", &format!("Name=Fancy\nExec={}", tool.display()));
+    f.write("home/.local/share/icons/hicolor/index.theme", "x");
+    f.write("home/.config/fancy/settings", "x");
+
+    let inv = scan(&f.env());
+    let data = |title: &str| find(&inv.packages, title)[0].manual.as_ref().unwrap().data.clone();
+    assert!(data("Icons").is_empty(), "the shared icons folder is never an app's data");
+    assert!(data("Fancy").is_empty(), "a launcher name that isn't the app's own name doesn't pick folders");
 }

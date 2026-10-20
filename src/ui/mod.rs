@@ -100,6 +100,8 @@ pub struct State {
     /// Everything installed, as last read; update checks match against it.
     packages: RefCell<Rc<Vec<Package>>>,
     updates: updates::View,
+    /// Shown when this distro's own packages can't be read yet.
+    unsupported: adw::Banner,
     /// "browse" (the grid) or "updates".
     view: gtk::Stack,
     browse_tools: Vec<gtk::Widget>,
@@ -216,6 +218,10 @@ pub fn activate(app: &adw::Application) {
     sort_dd.set_tooltip_text(Some("Sort by"));
     hb.pack_end(&sort_dd);
     tv.add_top_bar(&hb);
+    let unsupported = adw::Banner::new(
+        "Depot can't read this system's own packages yet, so apps that came with it may show up as manual installs.",
+    );
+    tv.add_top_bar(&unsupported);
 
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, li| {
@@ -290,6 +296,7 @@ pub fn activate(app: &adw::Application) {
         cat,
         packages: RefCell::new(Rc::new(Vec::new())),
         updates: upd,
+        unsupported,
         view,
         browse_tools: vec![search.clone().upcast(), sort_dd.clone().upcast()],
     });
@@ -445,6 +452,7 @@ fn update_counts(st: &State) {
 
 fn loaded(st: &Rc<State>, inv: Inventory) {
     let mut counts = vec![0usize; CATS.len()];
+    st.unsupported.set_revealed(!inv.system_packages);
     *st.packages.borrow_mut() = Rc::new(inv.packages.clone());
     let items: Vec<glib::BoxedAnyObject> = inv
         .packages

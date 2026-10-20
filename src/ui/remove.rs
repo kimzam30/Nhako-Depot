@@ -5,6 +5,7 @@ use super::{State, reload};
 use crate::packagekit::{self, PkPackage};
 use adw::prelude::*;
 use depot_core::backend::{dpkg, manual};
+use depot_core::remove::{self as removal, DebPlan};
 use depot_core::updates::info;
 use depot_core::{Kind, Package};
 use gtk::{gio, glib};
@@ -29,50 +30,26 @@ fn short(p: &Path) -> String {
     }
 }
 
-/// Ask apt what removing this package would also take with it.
-fn simulate_deb(id: &str) -> (Vec<String>, Option<String>) {
-    let r = Command::new("apt-get").args(["-s", "remove", id]).env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C").output();
-    let Ok(r) = r else { return (Vec::new(), Some("apt-get isn't available.".into())) };
-    let out = String::from_utf8_lossy(&r.stdout);
-    let base = id.split(':').next().unwrap_or(id);
-    let extra = out
-        .lines()
-        .filter_map(|l| l.strip_prefix("Remv ")?.split_whitespace().next())
-        .filter(|m| m.split(':').next() != Some(base))
-        .map(str::to_string)
-        .collect();
-    let blocked = if out.contains("essential packages will be removed") {
-        Some("Removing this would also remove essential system packages.".into())
-    } else if !r.status.success() {
-        let err = String::from_utf8_lossy(&r.stderr);
-        let text = if err.trim().is_empty() { out.to_string() } else { err.to_string() };
-        Some(text.trim().lines().last().unwrap_or("apt refused.").to_string())
-    } else {
-        None
+/// Ask apt what removing this package would take with it, and what it would leave unused.
+fn simulate_apt(id: &str) -> DebPlan {
+    let sim = |autoremove: bool| {
+        let mut c = Command::new("apt-get");
+        c.args(["-s", "remove"]);
+        if autoremove {
+            c.arg("--autoremove");
+        }
+        c.arg(id).env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C").output()
     };
-    (extra, blocked)
-}
-
-/// What removing a Debian package involves, worked out with a dry run.
-#[derive(Default)]
-struct DebPlan {
-    /// Packages that need this one and go with it.
-    deps: Vec<String>,
-    /// Automatically installed packages nothing needs any more.
-    orphans: Vec<String>,
-    blocked: Option<String>,
-    /// PackageKit's id for the package, when PackageKit will do the removal.
-    pk_id: Option<String>,
-}
-
-const SYSTEM_NEEDS_IT: &str = "Your system needs this package to work, so it can't be removed.";
-
-fn pk_names(list: &[PkPackage], skip: &str) -> Vec<String> {
-    let mut v: Vec<String> =
-        list.iter().filter(|p| p.info == info::REMOVING && p.id != skip).map(|p| p.name().to_string()).collect();
-    v.sort();
-    v.dedup();
-    v
+    let (Ok(without), Ok(with)) = (sim(false), sim(true)) else {
+        return DebPlan { blocked: Some("apt-get isn't available.".into()), ..Default::default() };
+    };
+    fn text(b: &[u8]) -> String {
+        String::from_utf8_lossy(b).into_owned()
+    }
+    if let Some(b) = removal::apt_blocked(&text(&without.stdout), &text(&without.stderr), without.status.success()) {
+        return DebPlan { blocked: Some(b), ..Default::default() };
+    }
+    removal::plan_from_apt(id, &text(&with.stdout), &text(&without.stdout))
 }
 
 /// Dry-run the removal with PackageKit, or apt when PackageKit isn't installed.
@@ -90,11 +67,10 @@ async fn plan_deb(p: &Package) -> DebPlan {
             // two dry runs tell apart what must go with it and what is merely left unused
             let with = packagekit::remove(&ids, true, true, |_, _| {}).await;
             let without = packagekit::remove(&ids, true, false, |_, _| {}).await;
+            let pairs = |l: Vec<PkPackage>| l.into_iter().map(|k| (k.info, k.id)).collect::<Vec<_>>();
             match (with, without) {
                 (Ok(with), Ok(without)) => {
-                    let deps = pk_names(&without, &target.id);
-                    let orphans = pk_names(&with, &target.id).into_iter().filter(|n| !deps.contains(n)).collect();
-                    return DebPlan { deps, orphans, blocked: None, pk_id: Some(target.id.clone()) };
+                    return removal::plan_from_packagekit(&target.id, &pairs(with), &pairs(without));
                 }
                 (_, Err(e))
                     if matches!(
@@ -102,15 +78,14 @@ async fn plan_deb(p: &Package) -> DebPlan {
                         packagekit::ERROR_DEP_RESOLUTION_FAILED | packagekit::ERROR_CANNOT_REMOVE_SYSTEM_PACKAGE
                     ) =>
                 {
-                    return DebPlan { blocked: Some(SYSTEM_NEEDS_IT.into()), ..Default::default() };
+                    return DebPlan { blocked: Some(removal::SYSTEM_NEEDS_IT.into()), ..Default::default() };
                 }
                 _ => {}
             }
         }
     }
     let id = p.id.clone();
-    let (deps, blocked) = gio::spawn_blocking(move || simulate_deb(&id)).await.unwrap_or_default();
-    DebPlan { deps, blocked, ..Default::default() }
+    gio::spawn_blocking(move || simulate_apt(&id)).await.unwrap_or_default()
 }
 
 pub fn start(st: &Rc<State>, p: &Rc<Package>, button: &gtk::Button) {
@@ -137,7 +112,7 @@ fn listing(lines: &[String]) -> gtk::ScrolledWindow {
 }
 
 fn confirm(st: &Rc<State>, p: &Rc<Package>, plan: DebPlan) {
-    let DebPlan { deps: extra, orphans, blocked, pk_id } = plan;
+    let DebPlan { deps: extra, orphans, orphan_pk_ids, blocked, pk_id } = plan;
     if let Some(reason) = blocked {
         let d = adw::AlertDialog::builder().heading("Can't uninstall").body(reason).build();
         d.add_response("close", "Close");
@@ -225,30 +200,24 @@ fn confirm(st: &Rc<State>, p: &Rc<Package>, plan: DebPlan) {
     let (st, p) = (st.clone(), p.clone());
     d.connect_response(None, move |_, r| {
         if r == "remove" {
-            run(&st, &p, purge.is_active(), clean.is_active(), pk_id.clone());
+            // only the leftovers that were listed, and only if the box was shown and ticked
+            let (orphans, orphan_pk_ids) =
+                if clean.is_active() { (orphans.clone(), orphan_pk_ids.clone()) } else { (Vec::new(), Vec::new()) };
+            run(&st, &p, purge.is_active(), orphans, orphan_pk_ids, pk_id.clone());
         }
     });
-}
-
-/// A path we are willing to trash: inside home, not home itself, not a shared app folder.
-fn safe_target(t: &Path, home: &Path) -> bool {
-    let roots = manual::app_roots(home);
-    t.is_absolute()
-        && t.starts_with(home)
-        && t != home
-        && !roots.iter().any(|r| r == t)
-        && !t.components().any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 async fn trash_manual(p: &Package, with_data: bool) -> Outcome {
     let plan = p.manual.clone().unwrap_or_default();
     let h = home();
+    let shared = manual::app_roots(&h);
     let mut errors = Vec::new();
     for t in plan.files.iter().chain(if with_data { plan.data.iter() } else { [].iter() }) {
         if std::fs::symlink_metadata(t).is_err() {
             continue;
         }
-        if !safe_target(t, &h) {
+        if !removal::safe_target(t, &h, &shared) {
             errors.push(format!("Refused to touch {}", t.display()));
             continue;
         }
@@ -278,8 +247,9 @@ fn privileged(cmd: Vec<String>, root: bool) -> Outcome {
     }
 }
 
-async fn remove_with_packagekit(id: String, autoremove: bool, progress: Rc<Progress>) -> Outcome {
-    let r = packagekit::remove(&[id], false, autoremove, move |pct, pkg: Option<&PkPackage>| {
+/// Remove exactly these packages (and what depends on them, which the user was shown).
+async fn remove_with_packagekit(ids: Vec<String>, progress: Rc<Progress>) -> Outcome {
+    let r = packagekit::remove(&ids, false, false, move |pct, pkg: Option<&PkPackage>| {
         let frac = (pct <= 100).then(|| pct as f64 / 100.0);
         match pkg {
             Some(k) if k.info == info::REMOVING => progress.set(&format!("Removing {}…", k.name()), frac),
@@ -294,7 +264,15 @@ async fn remove_with_packagekit(id: String, autoremove: bool, progress: Rc<Progr
     }
 }
 
-fn run(st: &Rc<State>, p: &Rc<Package>, purge: bool, autoremove: bool, pk_id: Option<String>) {
+/// Remove `p`, plus exactly the `orphans` the user agreed to (apt names, with matching PackageKit ids).
+fn run(
+    st: &Rc<State>,
+    p: &Rc<Package>,
+    purge: bool,
+    orphans: Vec<String>,
+    orphan_pk_ids: Vec<String>,
+    pk_id: Option<String>,
+) {
     let (cmd, root): (Vec<String>, bool) = match p.kind {
         Kind::Manual => (Vec::new(), false),
         Kind::Flatpak => {
@@ -313,14 +291,7 @@ fn run(st: &Rc<State>, p: &Rc<Package>, purge: bool, autoremove: bool, pk_id: Op
             c.push(p.id.clone());
             (c, true)
         }
-        Kind::Deb => {
-            let mut c = vec!["apt-get".to_string(), if purge { "purge" } else { "remove" }.into(), "-y".into()];
-            if autoremove {
-                c.push("--autoremove".into());
-            }
-            c.push(p.id.clone());
-            (c, true)
-        }
+        Kind::Deb => (removal::apt_command(&p.id, purge, &orphans), true),
     };
     // PackageKit can't purge config files, so purging always goes through apt
     let pk_id = pk_id.filter(|_| !purge);
@@ -333,7 +304,8 @@ fn run(st: &Rc<State>, p: &Rc<Package>, purge: bool, autoremove: bool, pk_id: Op
         let r = if p.kind == Kind::Manual {
             trash_manual(&p, purge).await
         } else if let Some(id) = pk_id {
-            remove_with_packagekit(id, autoremove, progress.clone()).await
+            let ids = std::iter::once(id).chain(orphan_pk_ids).collect();
+            remove_with_packagekit(ids, progress.clone()).await
         } else {
             gio::spawn_blocking(move || privileged(cmd, root))
                 .await

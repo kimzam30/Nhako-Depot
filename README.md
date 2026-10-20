@@ -33,18 +33,16 @@ New to Depot? The **[step-by-step guide](docs/GUIDE.md)** walks you through ever
 
 ## Install
 
-Depot needs GTK 4.14 or newer and libadwaita 1.5 or newer: Ubuntu 24.04, Zorin OS 18, Linux Mint 22,
-Fedora 40, or anything newer. There are no ready-made downloads yet, so you build it once from source.
-It takes about five minutes.
+Depot works on Debian-based systems with GTK 4.14 or newer and libadwaita 1.5 or newer: Ubuntu 24.04,
+Zorin OS 18, Linux Mint 22, Debian 13, or anything newer based on them. Fedora and Arch can't be read
+yet (it's on the [roadmap](#roadmap)); there, Depot shows a notice and lists system apps as manual
+installs. There are no ready-made downloads yet, so you build it once from source. It takes about
+five minutes.
 
 **1. Install the build tools** (asks for your password):
 
 ```sh
-# Ubuntu, Zorin OS, Linux Mint, Debian
 sudo apt install git libgtk-4-dev libadwaita-1-dev pkg-config build-essential curl
-
-# Fedora
-sudo dnf install git gtk4-devel libadwaita-devel gcc curl
 ```
 
 **2. Install Rust**, if you don't have it. Choose the default option when asked, then close and reopen
