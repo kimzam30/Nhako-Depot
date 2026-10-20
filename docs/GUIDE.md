@@ -15,7 +15,7 @@ The list on the left is the **sidebar**. The number next to each entry tells you
 | --- | --- |
 | **All apps** | Every app that has an icon in your app menu |
 | **Updates** | Apps with a newer version waiting (see step 5) |
-| **Deb apps** | Apps from your system's own software sources |
+| **Deb apps**, **RPM apps** or **Pacman apps** | Apps from your system's own software sources (which one depends on your Linux) |
 | **Snap apps** | Apps from the Snap Store |
 | **Flatpak apps** | Apps from Flathub, which run in their own sandbox |
 | **Manual installs** | Apps you downloaded and installed by hand |
@@ -33,7 +33,10 @@ by size is the quickest way to find what's using your disk space.
 
 Each card has a badge saying how the app was installed. Hover over a badge for a short explanation.
 
-- **Deb**: installed from your system's software sources with apt.
+- **Deb**, **RPM** or **Pacman**: installed from your system's software sources (with apt, dnf or
+  pacman).
+- **AUR**: an Arch package built from the AUR or another source outside your repositories. Your
+  normal updates don't include it.
 - **Snap**: installed from the Snap Store. Snaps update themselves.
 - **Flatpak**: installed with Flatpak, usually from Flathub.
 - **Manual**: installed by hand, for example from a downloaded archive or script.
@@ -50,6 +53,11 @@ Click any card to open its page. You'll see:
   Flatpaks, whether it's installed for everyone or only for you.
 
 Click the back arrow at the top-left to return to the list.
+
+**Installed more than once?** Sometimes the same app is on your computer twice, for example as a
+Deb and as a Flatpak. Depot shows it as one card with a badge for each way it's installed. Its page
+has an **Installed 2 ways** section listing every copy; click **Show** next to one to see its details
+or uninstall just that copy. You usually only need one.
 
 If the Uninstall button is greyed out, hover over it to see why. Depot won't remove things your
 computer needs to work, such as the core of the system or the runtimes that Flatpak apps share.

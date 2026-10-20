@@ -19,7 +19,8 @@ pub fn remove_label(p: &Package) -> &'static str {
     }
 }
 
-pub fn show(st: &Rc<State>, p: Package) {
+/// Open the page for `p`. `others` are other copies of the same app installed different ways.
+pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
     let p = Rc::new(p);
     let tv = adw::ToolbarView::new();
     tv.add_top_bar(&adw::HeaderBar::new());
@@ -80,6 +81,9 @@ pub fn show(st: &Rc<State>, p: Package) {
     if let Some(reason) = &p.blocked {
         bx.append(&wrapped(reason, &["dim-label"]));
     }
+    if !others.is_empty() {
+        bx.append(&copies(st, &p, &others));
+    }
 
     let desc = if p.description.is_empty() { p.summary.as_str() } else { p.description.as_str() };
     bx.append(&label("About", &["title-4"]));
@@ -122,8 +126,12 @@ pub fn show(st: &Rc<State>, p: Package) {
             ("Branch", p.revision.clone()),
         ]),
         Kind::Manual => rows.push(("Location", p.location.clone())),
-        Kind::Deb => {
-            rows.push(("Section", p.section.clone()));
+        Kind::Rpm => rows.push(("Group", p.section.clone())),
+        Kind::Deb | Kind::Pacman => {
+            rows.push((if p.kind == Kind::Deb { "Section" } else { "Groups" }, p.section.clone()));
+            if p.foreign {
+                rows.push(("Comes from", p.channel.clone()));
+            }
             if p.role != Role::App {
                 let how = if p.user_installed { "By you" } else { "Automatically, because something else needs it" };
                 rows.push(("Installed", how.into()));
@@ -164,6 +172,40 @@ pub fn show(st: &Rc<State>, p: Package) {
         &gtk::ScrolledWindow::builder().child(&adw::Clamp::builder().maximum_size(760).child(&bx).build()).build(),
     ));
     st.nav.push(&adw::NavigationPage::new(&tv, &p.title));
+}
+
+/// The "Installed N ways" list: every copy of the app, each with a button to its own page.
+fn copies(st: &Rc<State>, p: &Rc<Package>, others: &[Package]) -> adw::PreferencesGroup {
+    let n = others.len() + 1;
+    let grp = adw::PreferencesGroup::builder()
+        .title(format!("Installed {n} ways"))
+        .description("This app is on your computer more than once. You usually only need one, so you can remove the copies you don't use.")
+        .build();
+    let all: Vec<Package> = std::iter::once((**p).clone()).chain(others.iter().cloned()).collect();
+    for (i, c) in all.iter().enumerate() {
+        let mut sub = vec![c.version.clone(), widgets::size_text(c.size)];
+        if c.kind == Kind::Flatpak {
+            sub.push(if c.system { "All users".into() } else { "Only you".into() });
+        }
+        let sub: Vec<String> = sub.into_iter().filter(|s| !s.is_empty()).collect();
+        let row = adw::ActionRow::builder()
+            .title(c.kind.source())
+            .subtitle(glib::markup_escape_text(&sub.join(" · ")))
+            .build();
+        row.add_prefix(&widgets::kind_badge(c.kind));
+        if i == 0 {
+            row.add_suffix(&label("This page", &["dim-label", "caption"]));
+        } else {
+            let b = gtk::Button::builder().label("Show").valign(gtk::Align::Center).build();
+            let (st, c) = (st.clone(), c.clone());
+            let rest: Vec<Package> = all.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| o.clone()).collect();
+            b.connect_clicked(move |_| show(&st, c.clone(), rest.clone()));
+            row.add_suffix(&b);
+            row.set_activatable_widget(Some(&b));
+        }
+        grp.add(&row);
+    }
+    grp
 }
 
 fn launch(st: &State, desktop: &std::path::Path) {

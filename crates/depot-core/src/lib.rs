@@ -4,8 +4,10 @@
 pub mod backend;
 pub mod desktop;
 pub mod exec;
+pub mod group;
 pub mod inventory;
 pub mod model;
+pub mod owners;
 pub mod remove;
 pub mod updates;
 pub mod xdg;

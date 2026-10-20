@@ -9,12 +9,15 @@ use adw::prelude::*;
 use depot_core::{Env, Inventory, Kind, Package, Role};
 use gtk::{gdk, gio, glib};
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-/// One package of the shared inventory plus precomputed keys, stored in the list model.
+/// One app of the shared inventory plus precomputed keys, stored in the list model. An app
+/// installed several ways is one item: the best copy, with the other copies in `also`.
 pub struct Item {
     all: Rc<Vec<Package>>,
     i: usize,
+    also: Vec<usize>,
     search: String,
     sort: String,
 }
@@ -22,6 +25,16 @@ pub struct Item {
 impl Item {
     pub fn p(&self) -> &Package {
         &self.all[self.i]
+    }
+
+    /// The other copies of this app.
+    pub fn others(&self) -> impl Iterator<Item = &Package> {
+        self.also.iter().map(|&j| &self.all[j])
+    }
+
+    /// Whether any copy belongs in a category, so a Deb + Snap app shows under both.
+    fn matches(&self, pred: fn(&Package) -> bool) -> bool {
+        pred(self.p()) || self.others().any(pred)
     }
 }
 
@@ -43,6 +56,18 @@ const CATS: &[Cat] = &[
         icon: "system-software-install-symbolic",
         advanced: false,
         pred: |p| p.role == Role::App && p.kind == Kind::Deb,
+    },
+    Cat {
+        name: "RPM apps",
+        icon: "system-software-install-symbolic",
+        advanced: false,
+        pred: |p| p.role == Role::App && p.kind == Kind::Rpm,
+    },
+    Cat {
+        name: "Pacman apps",
+        icon: "system-software-install-symbolic",
+        advanced: false,
+        pred: |p| p.role == Role::App && p.kind == Kind::Pacman,
     },
     Cat {
         name: "Snap apps",
@@ -142,7 +167,7 @@ pub fn activate(app: &adw::Application) {
         let (cat, query) = (cat.clone(), query.clone());
         gtk::CustomFilter::new(move |o| {
             let it = item(o);
-            (CATS[cat.get()].pred)(it.p()) && query.borrow().split_whitespace().all(|w| it.search.contains(w))
+            it.matches(CATS[cat.get()].pred) && query.borrow().split_whitespace().all(|w| it.search.contains(w))
         })
     };
     let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
@@ -240,7 +265,8 @@ pub fn activate(app: &adw::Application) {
     factory.connect_bind(|_, li| {
         let li = li.downcast_ref::<gtk::ListItem>().expect("ListItem");
         if let (Some(obj), Some(card)) = (li.item(), li.child()) {
-            widgets::bind_card(&card, item(&obj).p());
+            let it = item(&obj);
+            widgets::bind_card(&card, it.p(), &it.others().collect::<Vec<_>>());
         }
     });
     let grid = gtk::GridView::builder()
@@ -382,8 +408,10 @@ pub fn activate(app: &adw::Application) {
         let st = st.clone();
         grid.connect_activate(move |g, pos| {
             if let Some(obj) = g.model().and_then(|m| m.item(pos)) {
-                let p = item(&obj).p().clone();
-                detail::show(&st, p);
+                let it = item(&obj);
+                let (p, others) = (it.p().clone(), it.others().cloned().collect());
+                drop(it);
+                detail::show(&st, p, others);
             }
         });
     }
@@ -477,18 +505,32 @@ fn loaded(st: &Rc<State>, inv: Inventory) {
     st.unsupported.set_revealed(!inv.system_packages);
     let all = Rc::new(inv.packages);
     *st.packages.borrow_mut() = all.clone();
-    let items: Vec<glib::BoxedAnyObject> = all
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            for (i, c) in CATS.iter().enumerate() {
-                if (c.pred)(p) {
-                    counts[i] += 1;
+    // an app installed several ways gets one card, under its best copy
+    let mut also: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut hidden: HashSet<usize> = HashSet::new();
+    for g in inv.duplicates {
+        hidden.extend(&g[1..]);
+        also.insert(g[0], g[1..].to_vec());
+    }
+    let items: Vec<glib::BoxedAnyObject> = (0..all.len())
+        .filter(|i| !hidden.contains(i))
+        .map(|i| {
+            let it = Item {
+                all: all.clone(),
+                i,
+                also: also.remove(&i).unwrap_or_default(),
+                search: String::new(),
+                sort: String::new(),
+            };
+            for (n, c) in CATS.iter().enumerate() {
+                if it.matches(c.pred) {
+                    counts[n] += 1;
                 }
             }
-            let search = p.search_text();
-            let sort = p.title.to_lowercase();
-            glib::BoxedAnyObject::new(Item { all: all.clone(), i, search, sort })
+            let search =
+                std::iter::once(it.p()).chain(it.others()).map(Package::search_text).collect::<Vec<_>>().join(" ");
+            let sort = it.p().title.to_lowercase();
+            glib::BoxedAnyObject::new(Item { search, sort, ..it })
         })
         .collect();
     st.store.splice(0, st.store.n_items(), &items);

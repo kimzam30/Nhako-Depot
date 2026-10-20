@@ -35,6 +35,14 @@ pub fn kind_badge(k: Kind) -> gtk::Label {
     pill(k.badge(), &format!("badge-{}", k.css()), k.explain())
 }
 
+fn aur_badge() -> gtk::Label {
+    pill(
+        "AUR",
+        "badge-aur",
+        "Built from the AUR or another source outside your repositories. Pacman doesn't update it.",
+    )
+}
+
 fn broken_badge() -> gtk::Label {
     pill("Broken", "badge-broken", "The program this launcher starts is no longer installed.")
 }
@@ -45,8 +53,11 @@ pub fn extra_badges(p: &Package) -> Vec<gtk::Label> {
     if p.broken {
         v.push(broken_badge());
     }
+    if p.foreign {
+        v.push(aur_badge());
+    }
     match p.role {
-        Role::Tool if p.kind == Kind::Deb => v.push(pill("Library / tool", "badge-sys", "")),
+        Role::Tool if p.kind.is_native() => v.push(pill("Library / tool", "badge-sys", "")),
         Role::Tool => v.push(pill("No launcher", "badge-sys", "Installed, but it has no entry in the app menu.")),
         Role::Runtime => v.push(pill("Runtime", "badge-sys", "Shared parts that other apps need to run.")),
         Role::App => {}
@@ -182,7 +193,8 @@ pub fn card() -> gtk::Box {
     b
 }
 
-pub fn bind_card(card: &gtk::Widget, p: &Package) {
+/// Fill a card for `p`; `others` are other copies of the same app, shown as extra source badges.
+pub fn bind_card(card: &gtk::Widget, p: &Package, others: &[&Package]) {
     let img = card.first_child().and_downcast::<gtk::Image>().expect("icon");
     let title = img.next_sibling().and_downcast::<gtk::Label>().expect("title");
     let summ = title.next_sibling().and_downcast::<gtk::Label>().expect("summary");
@@ -194,11 +206,22 @@ pub fn bind_card(card: &gtk::Widget, p: &Package) {
         badges.remove(&c);
     }
     badges.append(&kind_badge(p.kind));
+    let mut shown = vec![p.kind];
+    for o in others {
+        if !shown.contains(&o.kind) {
+            shown.push(o.kind);
+            badges.append(&kind_badge(o.kind));
+        }
+    }
     if p.broken {
         badges.append(&broken_badge());
     }
+    if p.foreign {
+        badges.append(&aur_badge());
+    }
     let size = size_text(p.size);
-    if !size.is_empty() {
+    // the size of one copy would be misleading next to several source badges
+    if !size.is_empty() && others.is_empty() {
         badges.append(&label(&size, &["dim-label", "caption"]));
     }
 }

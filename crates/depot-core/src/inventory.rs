@@ -1,6 +1,6 @@
 //! Builds the full list of installed software and decides which launcher belongs to which package.
 
-use crate::backend::{dpkg, flatpak, manual, snap};
+use crate::backend::{dpkg, flatpak, manual, pacman, rpm, snap};
 use crate::exec::{self, Target};
 use crate::model::{Kind, Package, Role};
 use crate::xdg::{self, Launcher};
@@ -19,6 +19,12 @@ pub struct Env {
     pub desktops: Vec<String>,
     pub dpkg_dir: PathBuf,
     pub apt_states: PathBuf,
+    pub pacman_dir: PathBuf,
+    pub pacman_conf: PathBuf,
+    /// Ask the `pacman` command which packages are from the AUR (off in tests).
+    pub pacman_foreign: bool,
+    /// The rpm database folder, read through the `rpm` command.
+    pub rpm_db: Option<PathBuf>,
     pub snap_socket: Option<PathBuf>,
     pub snap_desktop_dir: PathBuf,
     pub flatpak: bool,
@@ -41,6 +47,10 @@ impl Env {
                 .collect(),
             dpkg_dir: "/var/lib/dpkg".into(),
             apt_states: "/var/lib/apt/extended_states".into(),
+            pacman_dir: "/var/lib/pacman".into(),
+            pacman_conf: "/etc/pacman.conf".into(),
+            pacman_foreign: true,
+            rpm_db: ["/var/lib/rpm", "/usr/lib/sysimage/rpm"].into_iter().map(PathBuf::from).find(|d| d.is_dir()),
             snap_socket: Some(snap::SOCKET.into()),
             snap_desktop_dir: snap::DESKTOP_DIR.into(),
             flatpak: true,
@@ -54,14 +64,68 @@ impl Env {
     }
 }
 
+/// The distro's own package manager, if Depot can read it. Only one is used, so a stray
+/// `rpm` on Ubuntu doesn't count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Native {
+    Dpkg,
+    Pacman,
+    Rpm,
+}
+
+impl Native {
+    fn detect(env: &Env) -> Option<Native> {
+        if env.dpkg_dir.join("status").exists() {
+            Some(Native::Dpkg)
+        } else if env.pacman_dir.join("local").is_dir() {
+            Some(Native::Pacman)
+        } else if env.rpm_db.as_deref().is_some_and(Path::is_dir) {
+            Some(Native::Rpm)
+        } else {
+            None
+        }
+    }
+
+    fn load(self, env: &Env) -> Result<Vec<Package>, String> {
+        match self {
+            Native::Dpkg => dpkg::load(&env.dpkg_dir, &env.apt_states),
+            Native::Pacman => pacman::load(&env.pacman_dir, &env.pacman_conf, env.pacman_foreign),
+            Native::Rpm => env.rpm_db.as_deref().map_or(Ok(Vec::new()), rpm::load),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Native::Dpkg => "Debian packages",
+            Native::Pacman => "Pacman packages",
+            Native::Rpm => "RPM packages",
+        }
+    }
+
+    fn owners(self, env: &Env, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
+        let cache = |name: &str| env.cache_dir.as_ref().map(|d| d.join(name));
+        match self {
+            Native::Dpkg => dpkg::owners(&env.dpkg_dir, cache("dpkg-owners").as_deref(), wanted),
+            Native::Pacman => pacman::owners(&env.pacman_dir, cache("pacman-owners").as_deref(), wanted),
+            Native::Rpm => env
+                .rpm_db
+                .as_deref()
+                .map(|db| rpm::owners(db, cache("rpm-owners").as_deref(), wanted))
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Inventory {
     pub packages: Vec<Package>,
     /// Sources that couldn't be read, in plain language.
     pub warnings: Vec<String>,
-    /// The system's own package database was found. When it wasn't (a distro Depot can't read
-    /// yet, such as Fedora or Arch), system apps can't be told apart from manual installs.
+    /// The system's own package database was found (dpkg, pacman or rpm). When it wasn't,
+    /// system apps can't be told apart from manual installs.
     pub system_packages: bool,
+    /// Apps installed more than one way, as indices into `packages`, best copy first.
+    pub duplicates: Vec<Vec<usize>>,
 }
 
 /// How a launcher was matched to its package.
@@ -201,8 +265,9 @@ fn manual_package(
 
 /// Read everything installed. Sources are read in parallel; one failing source only adds a warning.
 pub fn scan(env: &Env) -> Inventory {
-    let (debs, snaps, flats, launchers) = std::thread::scope(|s| {
-        let d = s.spawn(|| dpkg::load(&env.dpkg_dir, &env.apt_states));
+    let native = Native::detect(env);
+    let (natives, snaps, flats, launchers) = std::thread::scope(|s| {
+        let d = s.spawn(|| native.map_or(Ok(Vec::new()), |n| n.load(env)));
         let sn = s.spawn(|| env.snap_socket.as_deref().map_or(Ok(Vec::new()), snap::load));
         let f = s.spawn(|| if env.flatpak { flatpak::load() } else { Ok(Vec::new()) });
         let l = xdg::collect(&env.app_dirs);
@@ -212,7 +277,7 @@ pub fn scan(env: &Env) -> Inventory {
         (join(d), join(sn), join(f), l)
     });
 
-    let mut inv = Inventory { system_packages: env.dpkg_dir.join("status").exists(), ..Default::default() };
+    let mut inv = Inventory { system_packages: native.is_some(), ..Default::default() };
     let mut take = |r: Result<Vec<Package>, String>, what: &str| match r {
         Ok(v) => v,
         Err(e) => {
@@ -220,20 +285,26 @@ pub fn scan(env: &Env) -> Inventory {
             Vec::new()
         }
     };
-    let debs = take(debs, "Debian packages");
+    let natives = take(natives, native.map_or("System packages", Native::label));
     let snaps = take(snaps, "Snaps");
     let flats = take(flats, "Flatpaks");
-    let has_dpkg = !debs.is_empty();
 
-    let mut pkgs: Vec<Package> = Vec::with_capacity(debs.len() + snaps.len() + flats.len() + 16);
-    let mut deb_ix: HashMap<String, usize> = HashMap::new();
+    let mut pkgs: Vec<Package> = Vec::with_capacity(natives.len() + snaps.len() + flats.len() + 16);
+    // native packages by the name their database's file owners use: the id for dpkg, the
+    // package name for rpm and pacman (preferring the native-architecture copy)
+    let mut native_ix: HashMap<String, usize> = HashMap::new();
     let mut snap_ix: HashMap<String, usize> = HashMap::new();
     let mut flat_ix: HashMap<String, usize> = HashMap::new();
-    for p in debs.into_iter().chain(snaps).chain(flats) {
+    for p in natives.into_iter().chain(snaps).chain(flats) {
         let i = pkgs.len();
         match p.kind {
             Kind::Deb => {
-                deb_ix.insert(p.id.clone(), i);
+                native_ix.insert(p.id.clone(), i);
+            }
+            Kind::Rpm | Kind::Pacman => {
+                if p.id == p.name || !native_ix.contains_key(&p.name) {
+                    native_ix.insert(p.name.clone(), i);
+                }
             }
             Kind::Snap => {
                 snap_ix.insert(p.name.clone(), i);
@@ -264,14 +335,13 @@ pub fn scan(env: &Env) -> Inventory {
     }
     let claims: Vec<Claim> = shown.iter().map(|l| claim(l, env)).collect();
 
-    let owners = if has_dpkg {
+    let owners = if let Some(native) = native {
         let wanted: HashSet<PathBuf> = claims
             .iter()
             .filter_map(|c| if let Claim::Files(f, _, _) = c { Some(f.iter().map(|(p, _)| p.clone())) } else { None })
             .flatten()
             .collect();
-        let cache = env.cache_dir.as_ref().map(|d| d.join("dpkg-owners"));
-        dpkg::owners(&env.dpkg_dir, cache.as_deref(), &wanted)
+        native.owners(env, &wanted)
     } else {
         HashMap::new()
     };
@@ -301,7 +371,7 @@ pub fn scan(env: &Env) -> Inventory {
             Claim::WebApp(missing) => deferred.push((*l, None, true, *missing)),
             Claim::Files(files, program, missing) => {
                 let direct = files.iter().find(|(p, via_exec)| !via_exec && owners.contains_key(p));
-                match direct.and_then(|(p, _)| deb_ix.get(&owners[p])) {
+                match direct.and_then(|(p, _)| native_ix.get(&owners[p])) {
                     Some(&i) => attach(&mut pkgs[i], l),
                     None => deferred.push((*l, Some((files, program.as_deref())), false, *missing)),
                 }
@@ -317,7 +387,7 @@ pub fn scan(env: &Env) -> Inventory {
         .collect();
     for (l, files, web, broken) in deferred {
         if let Some((files, program)) = files {
-            let by_exec = files.iter().find_map(|(p, _)| owners.get(p)).and_then(|o| deb_ix.get(o));
+            let by_exec = files.iter().find_map(|(p, _)| owners.get(p)).and_then(|o| native_ix.get(o));
             if let Some(&i) = by_exec {
                 attach(&mut pkgs[i], l);
                 continue;
@@ -352,6 +422,7 @@ pub fn scan(env: &Env) -> Inventory {
         p.title = format!("{} ({})", p.title, if p.system { "all users" } else { "only you" });
     }
     pkgs.sort_by_cached_key(|p| p.title.to_lowercase());
+    inv.duplicates = crate::group::duplicates(&pkgs);
     inv.packages = pkgs;
     inv
 }

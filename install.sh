@@ -43,7 +43,9 @@ elif [ -x target/release/depot ]; then
 else
     echo "Depot has to be built first, and that needs a few tools:"
     echo
-    echo "  sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config build-essential"
+    echo "  sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config build-essential   # Ubuntu, Zorin, Mint, Debian"
+    echo "  sudo dnf install gtk4-devel libadwaita-devel gcc                            # Fedora"
+    echo "  sudo pacman -S --needed gtk4 libadwaita base-devel                          # Arch"
     echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust, if 'cargo' is missing"
     echo
     echo "Then run ./install.sh again."

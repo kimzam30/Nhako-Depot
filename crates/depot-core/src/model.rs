@@ -7,16 +7,25 @@ use std::path::PathBuf;
 pub enum Kind {
     #[default]
     Deb,
+    Rpm,
+    Pacman,
     Snap,
     Flatpak,
     Manual,
 }
 
 impl Kind {
+    /// The distro's own package format (Deb, RPM or Pacman), managed through PackageKit.
+    pub fn is_native(self) -> bool {
+        matches!(self, Kind::Deb | Kind::Rpm | Kind::Pacman)
+    }
+
     /// Short text for the badge on a card.
     pub fn badge(self) -> &'static str {
         match self {
             Kind::Deb => "Deb",
+            Kind::Rpm => "RPM",
+            Kind::Pacman => "Pacman",
             Kind::Snap => "Snap",
             Kind::Flatpak => "Flatpak",
             Kind::Manual => "Manual",
@@ -27,6 +36,8 @@ impl Kind {
     pub fn css(self) -> &'static str {
         match self {
             Kind::Deb => "deb",
+            Kind::Rpm => "rpm",
+            Kind::Pacman => "pacman",
             Kind::Snap => "snap",
             Kind::Flatpak => "flatpak",
             Kind::Manual => "manual",
@@ -37,9 +48,11 @@ impl Kind {
     pub fn source(self) -> &'static str {
         match self {
             Kind::Deb => "Debian package (apt)",
+            Kind::Rpm => "RPM package (dnf)",
+            Kind::Pacman => "Pacman package",
             Kind::Snap => "Snap",
             Kind::Flatpak => "Flatpak",
-            Kind::Manual => "Manual install (not deb, snap or flatpak)",
+            Kind::Manual => "Manual install (not from a package manager)",
         }
     }
 
@@ -47,6 +60,8 @@ impl Kind {
     pub fn explain(self) -> &'static str {
         match self {
             Kind::Deb => "Installed from your system's software sources with apt.",
+            Kind::Rpm => "Installed from your system's software sources with dnf.",
+            Kind::Pacman => "Installed with pacman, from your system's repositories or the AUR.",
             Kind::Snap => "Installed from the Snap Store. Snaps update themselves.",
             Kind::Flatpak => "Installed with Flatpak, usually from Flathub. Runs in its own sandbox.",
             Kind::Manual => {
@@ -99,6 +114,10 @@ pub struct Package {
     pub desktop: Option<PathBuf>,
     /// Other launchers that start the same software (e.g. copies made by install scripts).
     pub extra_launchers: Vec<PathBuf>,
+    /// Native packages: the architecture (`amd64`, `x86_64`, `all`, `noarch`, `any`, ...).
+    pub arch: String,
+    /// Pacman: not from the configured repositories (usually built from the AUR).
+    pub foreign: bool,
     /// Installed on purpose by the user rather than pulled in as a dependency.
     pub user_installed: bool,
     /// Why this can't be removed from Depot, if it can't.

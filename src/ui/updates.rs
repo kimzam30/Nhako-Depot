@@ -104,7 +104,7 @@ fn versions(u: &Update) -> String {
 
 fn source(u: &Update) -> &'static str {
     match u.kind {
-        Kind::Deb => "System package",
+        Kind::Deb | Kind::Rpm | Kind::Pacman => "System package",
         Kind::Snap => "Snap",
         Kind::Flatpak => "Flatpak",
         Kind::Manual => "",
@@ -264,8 +264,8 @@ pub fn run(st: &Rc<State>, list: Vec<Update>) {
     set_installing(st, true);
     let st = st.clone();
     glib::spawn_future_local(async move {
-        let deb_ids: Vec<String> = list.iter().filter(|u| u.kind == Kind::Deb).map(|u| u.id.clone()).collect();
-        let removed = if deb_ids.is_empty() { Vec::new() } else { updates::removals(&deb_ids).await };
+        let native_ids: Vec<String> = list.iter().filter(|u| u.kind.is_native()).map(|u| u.id.clone()).collect();
+        let removed = if native_ids.is_empty() { Vec::new() } else { updates::removals(&native_ids).await };
         if !removed.is_empty() && !confirm_removals(&st, &removed).await {
             set_installing(&st, false);
             run_queued(&st);

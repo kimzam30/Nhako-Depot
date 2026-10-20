@@ -85,7 +85,7 @@ async fn blocking(cmd: Vec<String>, root: bool) -> Result<(), Done> {
 
 /// Install the given updates. `status` gets a line of text and a fraction (`None` = unknown).
 pub async fn apply(list: &[Update], status: impl Fn(&str, Option<f64>) + Clone + 'static) -> Done {
-    let debs: Vec<&Update> = list.iter().filter(|u| u.kind == Kind::Deb).collect();
+    let debs: Vec<&Update> = list.iter().filter(|u| u.kind.is_native()).collect();
     let snaps: Vec<String> = list.iter().filter(|u| u.kind == Kind::Snap).map(|u| u.id.clone()).collect();
     let flats: Vec<&Update> = list.iter().filter(|u| u.kind == Kind::Flatpak).collect();
 

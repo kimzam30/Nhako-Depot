@@ -32,7 +32,8 @@ cargo run --release -- --list-only | less
    If the tool isn't installed, return `Ok(vec![])`, not an error. Keep the parsing in a separate
    `parse()` function so it can be unit-tested with sample output.
 3. Call it from `inventory::scan`, which runs backends in parallel, and teach `claim()` how to
-   recognise that type's launchers.
+   recognise that type's launchers. A distro package manager instead goes in `inventory::Native`,
+   with an `owners()` lookup built on `owners::cached` so file ownership is cached between runs.
 4. Add a `.badge-<name>` colour to `data/style.css`, then add the remove command in `src/ui/remove.rs`.
    If it can remove other things along with the app, list them in the confirmation first.
 5. For updates, add a check function to the backend (like `snap::refreshable`), match its results in

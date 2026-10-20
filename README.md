@@ -15,10 +15,11 @@ takes around 50 ms, from a single native program of about 1 MB.
 
 ## What it does
 
-- **Shows everything installed** as **Deb** (apt), **Snap**, **Flatpak** or **Manual** (installed by hand),
-  each with a badge that explains what it means.
+- **Shows everything installed** as **Deb** (apt), **RPM** (dnf), **Pacman** (including AUR builds),
+  **Snap**, **Flatpak** or **Manual** (installed by hand), each with a badge that explains what it means.
 - **Gets the source right.** Each app appears once, under the package it really came from, even
-  when an install script copied its launcher into place.
+  when an install script copied its launcher into place. An app installed more than one way (say
+  as a Deb and a Flatpak) gets one card that shows every copy, so you can keep just one.
 - **Updates.** Lists newer versions of your apps with their old and new version numbers. Update
   them one at a time or all at once. Libraries, drivers and runtimes are grouped into a single
   "System updates" entry.
@@ -33,16 +34,24 @@ New to Depot? The **[step-by-step guide](docs/GUIDE.md)** walks you through ever
 
 ## Install
 
-Depot works on Debian-based systems with GTK 4.14 or newer and libadwaita 1.5 or newer: Ubuntu 24.04,
-Zorin OS 18, Linux Mint 22, Debian 13, or anything newer based on them. Fedora and Arch can't be read
-yet (it's on the [roadmap](#roadmap)); there, Depot shows a notice and lists system apps as manual
-installs. There are no ready-made downloads yet, so you build it once from source. It takes about
+Depot needs GTK 4.14 or newer and libadwaita 1.5 or newer: Ubuntu 24.04, Zorin OS 18, Linux Mint 22,
+Debian 13, Fedora 40, Arch Linux, or anything newer. Debian-based systems are the most tested; Fedora
+and Arch support is new, so please [report](docs/GUIDE.md#reporting-a-problem) anything that looks
+wrong there. On Fedora, updating and removing system packages goes through PackageKit, which Fedora
+includes. There are no ready-made downloads yet, so you build it once from source. It takes about
 five minutes.
 
 **1. Install the build tools** (asks for your password):
 
 ```sh
+# Ubuntu, Zorin OS, Linux Mint, Debian
 sudo apt install git libgtk-4-dev libadwaita-1-dev pkg-config build-essential curl
+
+# Fedora
+sudo dnf install git gtk4-devel libadwaita-devel gcc curl
+
+# Arch Linux
+sudo pacman -S --needed git gtk4 libadwaita base-devel curl
 ```
 
 **2. Install Rust**, if you don't have it. Choose the default option when asked, then close and reopen
@@ -75,8 +84,8 @@ from your app menu by searching for **Depot**.
 - [x] Correct ownership detection (launcher copies, `Exec` targets, XDG overrides)
 - [x] Updates page with **Update** and **Update all** (PackageKit, Snap, Flatpak)
 - [x] Removal through PackageKit with progress and clean-up of unused dependencies
-- [ ] One card per app even when it's installed several ways
-- [ ] RPM (dnf, zypper) and Pacman (including AUR packages)
+- [x] One card per app even when it's installed several ways
+- [x] RPM (dnf, zypper) and Pacman (including AUR packages)
 - [ ] AppImage
 - [ ] Developer tools: pipx, cargo, npm, Homebrew, Nix
 - [ ] `.deb` and `.rpm` downloads on GitHub Releases
@@ -94,7 +103,7 @@ cargo run --release        # run the app
 
 | Path | What's there |
 | --- | --- |
-| `crates/depot-core` | Inventory engine with no GTK dependency: one backend per install type, launcher ownership, update matching, removal planning, caching |
+| `crates/depot-core` | Inventory engine with no GTK dependency: one backend per install type, launcher ownership, finding apps installed twice, update matching, removal planning, caching |
 | `src/packagekit.rs` | Small async PackageKit client over D-Bus |
 | `src/updates.rs` | Checking every source for updates and installing them |
 | `src/system.rs` | Running package-manager commands (with pkexec when needed) |

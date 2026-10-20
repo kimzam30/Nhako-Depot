@@ -1,6 +1,6 @@
 //! Available updates, matched to what's installed so they can be shown with a name, icon and version.
 
-use crate::backend::dpkg;
+use crate::backend;
 use crate::backend::flatpak::FlatpakUpdate;
 use crate::model::{Kind, Package, Role};
 use serde::Serialize;
@@ -66,18 +66,14 @@ fn from_installed(kind: Kind, id: String, name: &str, to: String, p: Option<&Pac
 /// Native package updates from PackageKit's `GetUpdates`, as `(info, package id)`.
 /// Held-back (`BLOCKED`) updates are skipped since they can't be installed.
 pub fn from_packagekit(pk: &[(u32, String)], inv: &[Package]) -> Vec<Update> {
-    let debs = index(inv, Kind::Deb);
-    let native = dpkg::native_arch();
+    let kind = backend::native_kind(inv);
+    let natives = index(inv, kind);
     pk.iter()
         .filter(|(i, _)| *i != info::BLOCKED)
         .filter_map(|(i, id)| {
             let (name, ver, arch, _) = pk_split(id)?;
-            let key = if arch.is_empty() || arch == "all" || arch == native {
-                name.to_string()
-            } else {
-                format!("{name}:{arch}")
-            };
-            let mut u = from_installed(Kind::Deb, id.clone(), name, ver.to_string(), debs.get(key.as_str()).copied());
+            let key = backend::native_id(kind, name, arch);
+            let mut u = from_installed(kind, id.clone(), name, ver.to_string(), natives.get(key.as_str()).copied());
             u.security = matches!(*i, info::SECURITY | info::CRITICAL);
             Some(u)
         })
@@ -120,6 +116,7 @@ pub fn retain_installed(ups: &mut Vec<Update>, inv: &[Package]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::dpkg;
 
     fn deb(id: &str, title: &str, ver: &str, role: Role) -> Package {
         let mut p = Package::new(Kind::Deb, id);

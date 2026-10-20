@@ -3,6 +3,9 @@
 .badge { border-radius: 99px; padding: 0 8px; font-size: 0.75em; font-weight: 700; }
 .badge-snap { background: alpha(#e95420, .18); color: #e95420; }
 .badge-deb { background: alpha(#d70a53, .16); color: #d70a53; }
+.badge-rpm { background: alpha(#3c6eb4, .18); color: #3c6eb4; }
+.badge-pacman { background: alpha(#1793d1, .18); color: #1793d1; }
+.badge-aur { background: alpha(#9141ac, .18); color: #9141ac; }
 .badge-flatpak { background: alpha(#4a90d9, .18); color: #4a90d9; }
 .badge-manual { background: alpha(#2ec27e, .18); color: #2ec27e; }
 .badge-sys { background: alpha(currentColor, .10); }

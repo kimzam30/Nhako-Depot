@@ -45,6 +45,20 @@ impl Fake {
         self.write("var/lib/dpkg/status", &s);
     }
 
+    /// A pacman package in the local database. Paths are absolute fixture paths, stored the way
+    /// pacman does: without the leading slash.
+    fn pacman(&self, name: &str, files: &[&Path], explicit: bool) {
+        let dir = format!("var/lib/pacman/local/{name}-1.0-1");
+        let reason = if explicit { "" } else { "%REASON%\n1\n" };
+        self.write(
+            &format!("{dir}/desc"),
+            &format!("%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%DESC%\n{name} package\n\n%ARCH%\nx86_64\n\n{reason}"),
+        );
+        let list: String =
+            files.iter().map(|f| format!("{}\n", f.display().to_string().trim_start_matches('/'))).collect();
+        self.write(&format!("{dir}/files"), &format!("%FILES%\n{list}"));
+    }
+
     fn launcher(&self, rel: &str, body: &str) -> PathBuf {
         self.write(rel, &format!("[Desktop Entry]\nType=Application\n{body}\n"))
     }
@@ -61,6 +75,10 @@ impl Fake {
             desktops: vec!["GNOME".into()],
             dpkg_dir: self.p("var/lib/dpkg"),
             apt_states: self.p("var/lib/apt/extended_states"),
+            pacman_dir: self.p("var/lib/pacman"),
+            pacman_conf: self.p("etc/pacman.conf"),
+            pacman_foreign: false,
+            rpm_db: None,
             snap_socket: None,
             snap_desktop_dir: self.p("var/lib/snapd/desktop/applications"),
             flatpak: false,
@@ -291,4 +309,30 @@ fn launcher_with_missing_tryexec_is_skipped() {
     let inv = scan(&f.env());
     assert!(find(&inv.packages, "Gone").is_empty(), "the app menu hides it, so Depot does too");
     assert_eq!(find(&inv.packages, "Here").len(), 1);
+}
+
+/// On Arch, launchers belong to the pacman package that owns them or their program.
+#[test]
+fn pacman_packages_own_their_launchers() {
+    let f = Fake::new("pacman");
+    let bin = f.exe("usr/lib/firefox/firefox");
+    let own = f.launcher("usr/share/applications/firefox.desktop", &format!("Name=Firefox\nExec={} %u", bin.display()));
+    f.pacman("firefox", &[&bin, &own], true);
+    let tool = f.exe("usr/bin/htop");
+    f.launcher("usr/share/applications/htop.desktop", &format!("Name=Htop\nExec={}", tool.display()));
+    f.pacman("htop", &[&tool], false);
+    f.pacman("glibc", &[], false);
+    f.write("etc/pacman.conf", "[options]\nHoldPkg = pacman glibc\n");
+
+    let inv = scan(&f.env());
+    assert!(inv.system_packages && inv.warnings.is_empty(), "{:?}", inv.warnings);
+    let ff = find(&inv.packages, "Firefox");
+    assert_eq!(ff.len(), 1, "{ff:#?}");
+    assert_eq!((ff[0].kind, ff[0].role), (Kind::Pacman, Role::App));
+    assert!(ff[0].user_installed);
+    let htop = find(&inv.packages, "Htop")[0];
+    assert_eq!(htop.kind, Kind::Pacman, "owned through its program, not a manual install");
+    assert!(!htop.user_installed);
+    let glibc = inv.packages.iter().find(|p| p.id == "glibc").unwrap();
+    assert!(glibc.blocked.is_some(), "HoldPkg packages can't be removed");
 }
