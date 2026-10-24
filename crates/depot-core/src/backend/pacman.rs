@@ -5,6 +5,7 @@ use crate::owners;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Packages that must never be removed from Depot, on top of pacman.conf's `HoldPkg`.
 const ALWAYS_HELD: &[&str] = &["base", "filesystem", "glibc", "pacman", "systemd", "linux", "linux-lts", "linux-zen"];
@@ -66,20 +67,23 @@ pub fn parse_holdpkg(conf: &str) -> HashSet<String> {
 }
 
 /// Packages not found in any configured repository (`pacman -Qmq`), usually AUR builds.
-fn foreign_names() -> HashSet<String> {
-    Command::new("pacman")
-        .args(["-Qmq"])
-        .env("LC_ALL", "C")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
-        .unwrap_or_default()
+/// Without downloaded repository lists every package looks foreign, so then nothing is.
+fn foreign_names(dir: &Path) -> HashSet<String> {
+    let synced = std::fs::read_dir(dir.join("sync"))
+        .is_ok_and(|rd| rd.flatten().any(|e| e.path().extension().is_some_and(|x| x == "db")));
+    if !synced {
+        return HashSet::new();
+    }
+    match Command::new("pacman").arg("--dbpath").arg(dir).arg("-Qmq").env("LC_ALL", "C").output() {
+        // exit code 1 with no output just means there are none
+        Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect(),
+        Err(_) => HashSet::new(),
+    }
 }
 
 /// Package folders in the local database.
-fn entries(local: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(local)
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.join("desc").is_file()).collect())
-        .unwrap_or_default()
+fn entries(local: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(std::fs::read_dir(local)?.flatten().map(|e| e.path()).filter(|p| p.join("desc").is_file()).collect())
 }
 
 /// Installed packages. `ask_pacman` also asks pacman which ones came from outside the repositories.
@@ -89,8 +93,9 @@ pub fn load(dir: &Path, conf: &Path, ask_pacman: bool) -> Result<Vec<Package>, S
         return Ok(Vec::new());
     }
     let held = std::fs::read_to_string(conf).map(|t| parse_holdpkg(&t)).unwrap_or_default();
-    let foreign = if ask_pacman { foreign_names() } else { HashSet::new() };
+    let foreign = if ask_pacman { foreign_names(dir) } else { HashSet::new() };
     let mut out: Vec<Package> = entries(&local)
+        .map_err(|e| format!("Couldn't read {}: {e}", local.display()))?
         .iter()
         .filter_map(|e| parse_desc(&std::fs::read_to_string(e.join("desc")).ok()?, &held, &foreign))
         .collect();
@@ -108,15 +113,23 @@ fn folder_name(dir: &Path) -> Option<String> {
 
 /// Find which package owns each wanted path by scanning the `files` lists in parallel.
 /// Paths in those lists have no leading slash.
-pub fn scan_owners(local: &Path, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
+pub fn scan_owners(local: &Path, wanted: &HashSet<PathBuf>) -> Result<HashMap<PathBuf, String>, String> {
     if wanted.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
     let keys: HashSet<String> =
         wanted.iter().filter_map(|p| p.to_str()?.strip_prefix('/').map(str::to_string)).collect();
-    let mut found = owners::parallel(&entries(local), |e| {
-        let (Some(name), Ok(text)) = (folder_name(e), std::fs::read_to_string(e.join("files"))) else {
-            return Vec::new();
+    let dirs = entries(local).map_err(|e| format!("Couldn't read {}: {e}", local.display()))?;
+    let failed = AtomicBool::new(false);
+    let found = owners::parallel(&dirs, |e| {
+        let Some(name) = folder_name(e) else { return Vec::new() };
+        let text = match std::fs::read_to_string(e.join("files")) {
+            Ok(t) => t,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(_) => {
+                failed.store(true, Ordering::Relaxed);
+                return Vec::new();
+            }
         };
         let files = sections(&text).remove("FILES").unwrap_or_default();
         files
@@ -125,16 +138,18 @@ pub fn scan_owners(local: &Path, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, 
             .map(|f| (PathBuf::from(format!("/{f}")), name.clone()))
             .collect()
     });
-    found.sort();
-    let mut out = HashMap::new();
-    for (p, o) in found {
-        out.entry(p).or_insert(o);
+    if failed.into_inner() {
+        return Err("Some of pacman's file lists couldn't be read.".into());
     }
-    out
+    Ok(owners::first_owner(found))
 }
 
 /// [`scan_owners`] with an on-disk cache that stays valid until the local database changes.
-pub fn owners(dir: &Path, cache: Option<&Path>, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
+pub fn owners(
+    dir: &Path,
+    cache: Option<&Path>,
+    wanted: &HashSet<PathBuf>,
+) -> (HashMap<PathBuf, String>, Option<String>) {
     let local = dir.join("local");
     let stamp = format!("depot-pacman-owners-v1 {}", owners::mtime_ns(&local));
     owners::cached(cache, &stamp, wanted, |misses| scan_owners(&local, misses))

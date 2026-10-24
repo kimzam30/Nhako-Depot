@@ -22,8 +22,10 @@ const ERROR_NOT_AUTHORIZED: u32 = 48;
 const ERROR_TRANSACTION_CANCELLED: u32 = 17;
 pub const ERROR_DEP_RESOLUTION_FAILED: u32 = 13;
 pub const ERROR_CANNOT_REMOVE_SYSTEM_PACKAGE: u32 = 20;
-/// `Percentage` is 101 while PackageKit doesn't know yet.
-pub const UNKNOWN_PERCENT: u32 = 101;
+
+/// Transaction `Status` values (PkStatusEnum) that change what the user is told.
+pub const STATUS_WAITING_FOR_LOCK: u32 = 30;
+pub const STATUS_WAITING_FOR_AUTH: u32 = 31;
 
 #[derive(Clone, Debug)]
 pub struct PkPackage {
@@ -62,6 +64,20 @@ enum Event {
     Error(u32, String),
     Finished(u32),
     Progress(u32),
+    Status(u32),
+    AllowCancel(bool),
+}
+
+/// What a running transaction reports.
+pub enum Report<'a> {
+    /// How far along it is, `None` while PackageKit doesn't know.
+    Fraction(Option<f64>),
+    /// A package it's working on.
+    Package(&'a PkPackage),
+    /// A `Status` value, see the `STATUS_*` constants.
+    Status(u32),
+    /// Whether pressing Cancel can still stop it.
+    CanCancel(bool),
 }
 
 /// Whether PackageKit is installed (it's started on demand, so this doesn't need it running).
@@ -109,16 +125,26 @@ async fn transaction(interactive: bool) -> Result<gio::DBusProxy, PkError> {
     Ok(tx)
 }
 
-/// Run one transaction method and collect the packages it reports.
-/// `progress` gets 0–100, or [`UNKNOWN_PERCENT`].
+/// Run one transaction method and collect the packages it reports. Cancelling `cancel` asks
+/// PackageKit to stop, which it does whenever it last reported it can.
 pub async fn run(
     interactive: bool,
     method: &str,
     args: glib::Variant,
-    progress: impl Fn(u32, Option<&PkPackage>) + 'static,
+    cancel: &gio::Cancellable,
+    report: impl Fn(Report<'_>) + 'static,
 ) -> Result<Vec<PkPackage>, PkError> {
     let tx = transaction(interactive).await?;
-    let (send, mut recv) = mpsc::unbounded::<Event>();
+    let stop = {
+        let tx = tx.clone();
+        cancel.connect_cancelled_local(move |_| {
+            let tx = tx.clone();
+            glib::spawn_future_local(async move {
+                let _ = tx.call_future("Cancel", None, gio::DBusCallFlags::NONE, 10_000).await;
+            });
+        })
+    };
+    let (send, recv) = mpsc::unbounded::<Event>();
     let s = send.clone();
     tx.connect_g_signal(move |_, _, signal, params| {
         let ev = match signal {
@@ -136,10 +162,31 @@ pub async fn run(
         }
     });
     tx.connect_g_properties_changed(move |_, changed, _| {
-        if let Ok(Some(p)) = glib::VariantDict::new(Some(changed)).lookup::<u32>("Percentage") {
+        let d = glib::VariantDict::new(Some(changed));
+        if let Ok(Some(p)) = d.lookup::<u32>("Percentage") {
             let _ = send.unbounded_send(Event::Progress(p));
         }
+        if let Ok(Some(s)) = d.lookup::<u32>("Status") {
+            let _ = send.unbounded_send(Event::Status(s));
+        }
+        if let Ok(Some(c)) = d.lookup::<bool>("AllowCancel") {
+            let _ = send.unbounded_send(Event::AllowCancel(c));
+        }
     });
+    let r = events(&tx, method, args, recv, report).await;
+    if let Some(id) = stop {
+        cancel.disconnect_cancelled(id);
+    }
+    r
+}
+
+async fn events(
+    tx: &gio::DBusProxy,
+    method: &str,
+    args: glib::Variant,
+    mut recv: mpsc::UnboundedReceiver<Event>,
+    report: impl Fn(Report<'_>),
+) -> Result<Vec<PkPackage>, PkError> {
     let call = tx.call_future(method, Some(&args), gio::DBusCallFlags::NONE, -1).await;
     if let Err(e) = call {
         let refused = e.message().contains("RefusedByPolicy") || e.message().contains("NotAuthorized");
@@ -150,10 +197,12 @@ pub async fn run(
     while let Some(ev) = recv.next().await {
         match ev {
             Event::Package(p) => {
-                progress(UNKNOWN_PERCENT, Some(&p));
+                report(Report::Package(&p));
                 packages.push(p);
             }
-            Event::Progress(n) => progress(n, None),
+            Event::Progress(n) => report(Report::Fraction(crate::system::fraction(n))),
+            Event::Status(s) => report(Report::Status(s)),
+            Event::AllowCancel(c) => report(Report::CanCancel(c)),
             Event::Error(c, d) => error = Some((c, d)),
             Event::Finished(EXIT_SUCCESS) => return Ok(packages),
             Event::Finished(exit) => {
@@ -167,20 +216,23 @@ pub async fn run(
     Err(PkError::plain("Lost contact with PackageKit."))
 }
 
-fn quiet(_: u32, _: Option<&PkPackage>) {}
+/// A quick query nobody watches or cancels.
+async fn query(method: &str, args: glib::Variant) -> Result<Vec<PkPackage>, PkError> {
+    run(false, method, args, &gio::Cancellable::new(), |_| {}).await
+}
 
 /// Refresh the package lists from the internet. Allowed without a password for local users.
 pub async fn refresh_cache() -> Result<(), PkError> {
-    run(false, "RefreshCache", (false,).to_variant(), quiet).await.map(|_| ())
+    query("RefreshCache", (false,).to_variant()).await.map(|_| ())
 }
 
 pub async fn get_updates() -> Result<Vec<PkPackage>, PkError> {
-    run(false, "GetUpdates", (FILTER_NONE,).to_variant(), quiet).await
+    query("GetUpdates", (FILTER_NONE,).to_variant()).await
 }
 
 /// PackageKit ids of installed packages, by name.
 pub async fn resolve_installed(names: &[String]) -> Result<Vec<PkPackage>, PkError> {
-    run(false, "Resolve", (FILTER_INSTALLED, names.to_vec()).to_variant(), quiet).await
+    query("Resolve", (FILTER_INSTALLED, names.to_vec()).to_variant()).await
 }
 
 /// Remove packages along with anything that depends on them, and with `autoremove`, dependencies
@@ -190,10 +242,16 @@ pub async fn remove(
     ids: &[String],
     simulate: bool,
     autoremove: bool,
-    progress: impl Fn(u32, Option<&PkPackage>) + 'static,
+    cancel: &gio::Cancellable,
+    report: impl Fn(Report<'_>) + 'static,
 ) -> Result<Vec<PkPackage>, PkError> {
     let flags = if simulate { ONLY_TRUSTED | SIMULATE } else { ONLY_TRUSTED };
-    run(!simulate, "RemovePackages", (flags, ids.to_vec(), true, autoremove).to_variant(), progress).await
+    run(!simulate, "RemovePackages", (flags, ids.to_vec(), true, autoremove).to_variant(), cancel, report).await
+}
+
+/// A dry run of [`remove`]: everything that would be removed, changing nothing.
+pub async fn simulate_remove(ids: &[String], autoremove: bool) -> Result<Vec<PkPackage>, PkError> {
+    remove(ids, true, autoremove, &gio::Cancellable::new(), |_| {}).await
 }
 
 /// Update packages to the versions reported by [`get_updates`]. With `simulate`, nothing changes and
@@ -201,8 +259,25 @@ pub async fn remove(
 pub async fn update(
     ids: &[String],
     simulate: bool,
-    progress: impl Fn(u32, Option<&PkPackage>) + 'static,
+    cancel: &gio::Cancellable,
+    report: impl Fn(Report<'_>) + 'static,
 ) -> Result<Vec<PkPackage>, PkError> {
     let flags = if simulate { ONLY_TRUSTED | SIMULATE } else { ONLY_TRUSTED };
-    run(!simulate, "UpdatePackages", (flags, ids.to_vec()).to_variant(), progress).await
+    run(!simulate, "UpdatePackages", (flags, ids.to_vec()).to_variant(), cancel, report).await
+}
+
+/// A dry run of [`update`]: every package the update would touch, changing nothing.
+pub async fn simulate_update(ids: &[String]) -> Result<Vec<PkPackage>, PkError> {
+    update(ids, true, &gio::Cancellable::new(), |_| {}).await
+}
+
+impl PkError {
+    /// This error as an [`Outcome`](crate::system::Outcome) the user can read.
+    pub fn outcome(self) -> crate::system::Outcome {
+        if self.cancelled {
+            return crate::system::Outcome::Cancelled;
+        }
+        let summary = crate::system::plain(&self.details, (self.code != 0).then_some(self.code));
+        crate::system::Outcome::Failed { summary, details: self.details }
+    }
 }

@@ -1,5 +1,24 @@
-.pkg-card { padding: 16px 14px 12px 14px; }
+/* Cards */
+.pkg-card {
+  padding: 16px 14px 12px 14px;
+  transition: background 150ms ease-out, box-shadow 150ms ease-out, transform 120ms ease-out;
+}
 .pkg-card:hover { background: alpha(currentColor, .06); }
+.pkg-card:active { transform: scale(.98); }
+.pkg-card.selected {
+  background: alpha(@accent_bg_color, .12);
+  box-shadow: inset 0 0 0 2px @accent_bg_color;
+}
+.card-tick { animation: pop 180ms ease-out; }
+
+/* Placeholder cards while the inventory is read */
+.skeleton { background: alpha(currentColor, .06); box-shadow: none; animation: shimmer 1.4s ease-in-out infinite; }
+.skeleton-1 { animation-delay: 150ms; }
+.skeleton-2 { animation-delay: 300ms; }
+.skeleton-3 { animation-delay: 450ms; }
+@keyframes shimmer { 0% { opacity: .55; } 50% { opacity: 1; } 100% { opacity: .55; } }
+
+/* Source badges */
 .badge { border-radius: 99px; padding: 0 8px; font-size: 0.75em; font-weight: 700; }
 .badge-snap { background: alpha(#e95420, .18); color: #e95420; }
 .badge-deb { background: alpha(#d70a53, .16); color: #d70a53; }
@@ -10,4 +29,15 @@
 .badge-manual { background: alpha(#2ec27e, .18); color: #2ec27e; }
 .badge-sys { background: alpha(currentColor, .10); }
 .badge-broken { background: alpha(#e5a50a, .20); color: #c88800; }
-.sidebar-section { margin: 12px 12px 4px 12px; }
+
+/* Sidebar */
+.chevron { transition: -gtk-icon-transform 200ms ease-out; }
+.chevron.open { -gtk-icon-transform: rotate(90deg); }
+.count.bump { animation: bump 400ms ease-out; }
+@keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.35); } 100% { transform: scale(1); } }
+
+/* Progress sheet */
+.op-pop { animation: pop 320ms cubic-bezier(.34, 1.56, .64, 1); }
+.op-pulse { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pop { from { transform: scale(.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes pulse { 0% { opacity: 1; } 50% { opacity: .45; } 100% { opacity: 1; } }

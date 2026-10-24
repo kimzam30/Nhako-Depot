@@ -16,12 +16,16 @@ pub fn mtime_ns(p: &Path) -> u128 {
 
 /// Owners of `wanted` paths. `stamp` identifies the database state; answers cached under an
 /// older stamp are thrown away. `scan` looks up the paths the cache doesn't know yet.
+///
+/// When `scan` fails, the paths it was asked about stay unknown rather than being remembered as
+/// unowned (a locked database would otherwise turn every system app into a manual install until
+/// the next install), and the error comes back alongside the owners that were already known.
 pub fn cached(
     cache: Option<&Path>,
     stamp: &str,
     wanted: &HashSet<PathBuf>,
-    scan: impl FnOnce(&HashSet<PathBuf>) -> HashMap<PathBuf, String>,
-) -> HashMap<PathBuf, String> {
+    scan: impl FnOnce(&HashSet<PathBuf>) -> Result<HashMap<PathBuf, String>, String>,
+) -> (HashMap<PathBuf, String>, Option<String>) {
     let mut known: HashMap<PathBuf, Option<String>> = HashMap::new();
     if let Some(text) = cache.and_then(|c| std::fs::read_to_string(c).ok()) {
         let mut lines = text.lines();
@@ -34,17 +38,33 @@ pub fn cached(
         }
     }
     let misses: HashSet<PathBuf> = wanted.iter().filter(|p| !known.contains_key(*p)).cloned().collect();
+    let mut error = None;
     if !misses.is_empty() {
-        let found = scan(&misses);
-        for m in misses {
-            let o = found.get(&m).cloned();
-            known.insert(m, o);
-        }
-        if let Some(c) = cache {
-            save(c, stamp, &known);
+        match scan(&misses) {
+            Ok(found) => {
+                for m in misses {
+                    let o = found.get(&m).cloned();
+                    known.insert(m, o);
+                }
+                if let Some(c) = cache {
+                    save(c, stamp, &known);
+                }
+            }
+            Err(e) => error = Some(e),
         }
     }
-    wanted.iter().filter_map(|p| Some((p.clone(), known.get(p)?.clone()?))).collect()
+    (wanted.iter().filter_map(|p| Some((p.clone(), known.get(p)?.clone()?))).collect(), error)
+}
+
+/// One owner per path from a scan's raw hits. Directories and diverted files can appear in
+/// several packages' lists, so the pick is made stable.
+pub fn first_owner(mut found: Vec<(PathBuf, String)>) -> HashMap<PathBuf, String> {
+    found.sort();
+    let mut out = HashMap::new();
+    for (p, o) in found {
+        out.entry(p).or_insert(o);
+    }
+    out
 }
 
 fn save(c: &Path, stamp: &str, known: &HashMap<PathBuf, Option<String>>) {
@@ -59,7 +79,8 @@ fn save(c: &Path, stamp: &str, known: &HashMap<PathBuf, Option<String>>) {
     if let Some(dir) = c.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let tmp = c.with_extension("tmp");
+    // per process, so the app and `depot --list-only` running at once don't write the same file
+    let tmp = c.with_extension(format!("tmp{}", std::process::id()));
     if std::fs::write(&tmp, text).is_ok() {
         let _ = std::fs::rename(&tmp, c);
     }
@@ -91,15 +112,31 @@ mod tests {
         let lookup = |w: &HashSet<PathBuf>| {
             w.iter().filter(|p| *p == Path::new("/a")).map(|p| (p.clone(), "pkg".to_string())).collect()
         };
-        let first = cached(Some(&c), "v1", &wanted, lookup);
+        let (first, _) = cached(Some(&c), "v1", &wanted, |w| Ok(lookup(w)));
         assert_eq!(first.get(Path::new("/a")).map(String::as_str), Some("pkg"));
         assert!(!first.contains_key(Path::new("/b")));
         // same stamp: served from the cache, including the known miss
-        let again = cached(Some(&c), "v1", &wanted, |_| panic!("should be cached"));
+        let (again, _) = cached(Some(&c), "v1", &wanted, |_| panic!("should be cached"));
         assert_eq!(again, first);
         // new stamp: looked up again
-        let fresh = cached(Some(&c), "v2", &wanted, |_| HashMap::new());
+        let (fresh, _) = cached(Some(&c), "v2", &wanted, |_| Ok(HashMap::new()));
         assert!(fresh.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_lookup_is_not_remembered() {
+        let dir = std::env::temp_dir().join(format!("depot-owners-fail-{}", std::process::id()));
+        let c = dir.join("cache");
+        let wanted: HashSet<PathBuf> = [PathBuf::from("/a")].into();
+        let (none, err) = cached(Some(&c), "v1", &wanted, |_| Err("database is locked".into()));
+        assert!(none.is_empty());
+        assert_eq!(err.as_deref(), Some("database is locked"));
+        // the next run asks again instead of trusting a cached "unowned"
+        let (found, err) =
+            cached(Some(&c), "v1", &wanted, |w| Ok(w.iter().map(|p| (p.clone(), "pkg".into())).collect()));
+        assert_eq!(found.get(Path::new("/a")).map(String::as_str), Some("pkg"));
+        assert!(err.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

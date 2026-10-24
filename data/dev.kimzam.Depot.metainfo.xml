@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Kim -->
+<component type="desktop-application">
+  <id>dev.kimzam.Depot</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Depot</name>
+  <summary>See, update and remove every app on your computer</summary>
+
+  <developer id="dev.kimzam">
+    <name>Kim</name>
+  </developer>
+
+  <description>
+    <p>
+      Linux software comes from many places: your distribution's own packages, Snap, Flatpak,
+      downloaded archives and more. Depot puts all of it in one window, tells you in plain language
+      how each app was installed, and updates or removes it the right way, so you don't need to know
+      which command to use.
+    </p>
+    <p>Depot is made for people who are new to Linux:</p>
+    <ul>
+      <li>Every app in one place, with a badge saying whether it's a Deb, RPM, Pacman, Snap, Flatpak or manual install</li>
+      <li>One card per app, even when it's installed more than one way</li>
+      <li>Tick several apps and uninstall them together, or tick exactly which updates to install</li>
+      <li>Before anything is removed, Depot shows exactly what will go with it</li>
+      <li>Apps installed by hand go to the Trash, so you can change your mind</li>
+      <li>Finds broken launchers left behind in your app menu</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">dev.kimzam.Depot.desktop</launchable>
+  <provides>
+    <binary>depot</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/kimzam30/Nhako-Depot</url>
+  <url type="bugtracker">https://github.com/kimzam30/Nhako-Depot/issues</url>
+  <url type="vcs-browser">https://github.com/kimzam30/Nhako-Depot</url>
+  <url type="help">https://github.com/kimzam30/Nhako-Depot/blob/main/docs/GUIDE.md</url>
+
+  <categories>
+    <category>System</category>
+    <category>PackageManager</category>
+  </categories>
+  <keywords>
+    <keyword>uninstall</keyword>
+    <keyword>remove</keyword>
+    <keyword>update</keyword>
+    <keyword>apps</keyword>
+    <keyword>packages</keyword>
+    <keyword>snap</keyword>
+    <keyword>flatpak</keyword>
+    <keyword>deb</keyword>
+  </keywords>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#f6a6c1</color>
+    <color type="primary" scheme_preference="dark">#7a3a52</color>
+  </branding>
+
+  <content_rating type="oars-1.1"/>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+
+  <releases>
+    <release version="0.3.0" date="2026-10-24">
+      <description>
+        <ul>
+          <li>Select several apps and uninstall them together</li>
+          <li>Tick exactly which updates to install</li>
+          <li>A progress window that says when your password was accepted and how everything went</li>
+          <li>Safer clean-up of apps installed by hand</li>
+          <li>An About window with the licence, privacy and legal notices</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-10-20">
+      <description>
+        <p>Updates page, removal through PackageKit, and support for RPM and Pacman systems.</p>
+      </description>
+    </release>
+  </releases>
+</component>

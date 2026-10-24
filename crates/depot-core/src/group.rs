@@ -66,12 +66,12 @@ pub fn duplicates(pkgs: &[Package]) -> Vec<Vec<usize>> {
     let same_kind_clash = |m: &[usize]| {
         m.iter().any(|&a| m.iter().any(|&b| pkgs[a].kind == pkgs[b].kind && pkgs[a].name != pkgs[b].name))
     };
+    // every member joins the first: neighbours alone would leave out a copy that sits next to
+    // another copy of its own kind (GIMP for everyone, GIMP for you, then the deb)
     for members in by_key.values().filter(|m| !same_kind_clash(m)) {
-        for w in members.windows(2) {
-            if pkgs[w[0]].kind != pkgs[w[1]].kind {
-                let (a, b) = (find(&mut parent, w[0]), find(&mut parent, w[1]));
-                parent[a] = b;
-            }
+        for &m in &members[1..] {
+            let (a, b) = (find(&mut parent, members[0]), find(&mut parent, m));
+            parent[a] = b;
         }
     }
     let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -119,6 +119,14 @@ mod tests {
         ];
         let g = duplicates(&pkgs);
         assert_eq!(g, vec![vec![1, 2, 0], vec![3, 4]], "the deb comes first, then Flatpak, then Snap");
+    }
+
+    #[test]
+    fn flatpak_for_everyone_and_for_you_join_the_deb() {
+        let mut sys = app(Kind::Flatpak, "org.gimp.GIMP", "GIMP");
+        sys.system = true;
+        let pkgs = vec![sys, app(Kind::Flatpak, "org.gimp.GIMP", "GIMP"), app(Kind::Deb, "gimp", "GIMP")];
+        assert_eq!(duplicates(&pkgs), vec![vec![2, 0, 1]]);
     }
 
     #[test]

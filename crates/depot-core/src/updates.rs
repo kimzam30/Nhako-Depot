@@ -110,7 +110,10 @@ pub fn from_flatpaks(ups: &[FlatpakUpdate], inv: &[Package]) -> Vec<Update> {
 /// Drop updates for software that's no longer installed, so the list stays right after an
 /// uninstall without asking every store again.
 pub fn retain_installed(ups: &mut Vec<Update>, inv: &[Package]) {
-    ups.retain(|u| inv.iter().any(|p| p.kind == u.kind && p.name == u.name));
+    // a Flatpak can be installed for everyone and for you; each copy has its own update
+    ups.retain(|u| {
+        inv.iter().any(|p| p.kind == u.kind && p.name == u.name && (u.kind != Kind::Flatpak || p.system == u.system))
+    });
 }
 
 #[cfg(test)]

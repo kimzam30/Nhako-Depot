@@ -1,12 +1,14 @@
 //! Checking for and installing updates from every source at once.
 
-use crate::packagekit::{self, PkPackage};
-use crate::system;
+use crate::packagekit;
+use crate::system::Outcome;
+use crate::ui::operation::{self, Operation};
 use depot_core::backend::{flatpak, snap};
 use depot_core::{Kind, Package, Update, updates};
 use gtk::gio;
 use serde::Serialize;
 use std::path::Path;
+use std::rc::Rc;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Checked {
@@ -55,80 +57,100 @@ pub async fn check(refresh: bool, inv: &[Package]) -> Checked {
     out
 }
 
-/// How an update run ended.
-pub enum Done {
-    Ok,
-    Cancelled,
-    Failed(String),
-}
-
 /// Packages that updating these native packages would remove, found with a dry run.
-pub async fn removals(ids: &[String]) -> Vec<String> {
-    match packagekit::update(ids, true, |_, _| {}).await {
-        Ok(pk) => pk
-            .iter()
-            .filter(|p| matches!(p.info, updates::info::REMOVING | updates::info::OBSOLETING))
-            .map(|p| p.name().to_string())
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+pub async fn removals(ids: &[String]) -> Result<Vec<String>, Outcome> {
+    let pk = packagekit::simulate_update(ids).await.map_err(packagekit::PkError::outcome)?;
+    Ok(pk
+        .iter()
+        .filter(|p| matches!(p.info, updates::info::REMOVING | updates::info::OBSOLETING))
+        .map(|p| p.name().to_string())
+        .collect())
 }
 
-async fn blocking(cmd: Vec<String>, root: bool) -> Result<(), Done> {
-    match gio::spawn_blocking(move || system::run(&cmd, root)).await {
-        Ok(o) if o.code == 0 => Ok(()),
-        Ok(o) if o.cancelled() => Err(Done::Cancelled),
-        Ok(o) => Err(Done::Failed(o.tail(6))),
-        Err(_) => Err(Done::Failed("The updater crashed.".into())),
-    }
+/// Updates installed together: one PackageKit transaction, one `snap refresh`, or one
+/// `flatpak update` per installation.
+pub struct Batch {
+    /// What the sheet's checklist calls it.
+    pub title: String,
+    what: What,
 }
 
-/// Install the given updates. `status` gets a line of text and a fraction (`None` = unknown).
-pub async fn apply(list: &[Update], status: impl Fn(&str, Option<f64>) + Clone + 'static) -> Done {
-    let debs: Vec<&Update> = list.iter().filter(|u| u.kind.is_native()).collect();
+enum What {
+    Native(Vec<String>),
+    Snaps(Vec<String>),
+    Flatpaks { system: bool, refs: Vec<String> },
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Split `list` into the batches that install it.
+pub fn batches(list: &[Update]) -> Vec<Batch> {
+    let mut out = Vec::new();
+    let natives: Vec<String> = list.iter().filter(|u| u.kind.is_native()).map(|u| u.id.clone()).collect();
+    if !natives.is_empty() {
+        out.push(Batch { title: format!("System packages ({})", natives.len()), what: What::Native(natives) });
+    }
     let snaps: Vec<String> = list.iter().filter(|u| u.kind == Kind::Snap).map(|u| u.id.clone()).collect();
-    let flats: Vec<&Update> = list.iter().filter(|u| u.kind == Kind::Flatpak).collect();
-
-    // native updates only ever come from PackageKit (see `check`), so it does the installing too
-    if !debs.is_empty() {
-        let ids: Vec<String> = debs.iter().map(|u| u.id.clone()).collect();
-        let s = status.clone();
-        s("Preparing system updates…", None);
-        let r = packagekit::update(&ids, false, move |pct, pkg: Option<&PkPackage>| match pkg {
-            Some(p) => s(&format!("Updating {}…", p.name()), system::fraction(pct)),
-            None => s("", system::fraction(pct)),
-        })
-        .await;
-        match r {
-            Ok(_) => {}
-            Err(e) if e.cancelled => return Done::Cancelled,
-            Err(e) => return Done::Failed(e.details),
-        }
-    }
     if !snaps.is_empty() {
-        status(&format!("Updating {}…", snaps.join(", ")), None);
-        let mut cmd = vec!["snap".to_string(), "refresh".into()];
-        cmd.extend(snaps);
-        if let Err(d) = blocking(cmd, true).await {
-            return d;
+        out.push(Batch { title: format!("Snaps ({})", snaps.len()), what: What::Snaps(snaps) });
+    }
+    for system in [true, false] {
+        let refs: Vec<String> =
+            list.iter().filter(|u| u.kind == Kind::Flatpak && u.system == system).map(|u| u.id.clone()).collect();
+        if !refs.is_empty() {
+            let whose = if system { "for everyone" } else { "for you" };
+            out.push(Batch {
+                title: format!("Flatpaks {whose} ({})", refs.len()),
+                what: What::Flatpaks { system, refs },
+            });
         }
     }
-    for system_wide in [true, false] {
-        let refs: Vec<String> = flats.iter().filter(|u| u.system == system_wide).map(|u| u.id.clone()).collect();
-        if refs.is_empty() {
-            continue;
+    out
+}
+
+/// Install one batch, showing its progress in `op`.
+pub async fn apply(b: &Batch, op: &Rc<Operation>) -> Outcome {
+    match &b.what {
+        What::Native(ids) => {
+            op.progress("Preparing system updates…", None);
+            let cancel = gio::Cancellable::new();
+            let report = operation::pk_reporter(op, &cancel, |n| format!("Updating {n}…"));
+            match packagekit::update(ids, false, &cancel, report).await {
+                Ok(_) => Outcome::Done,
+                Err(e) => e.outcome(),
+            }
         }
-        status(&format!("Updating {} Flatpak item(s)…", refs.len()), None);
-        // Flatpak asks polkit itself for system-wide installs, so no pkexec here
-        let mut cmd: Vec<String> =
-            ["flatpak", "update", "-y", "--noninteractive", if system_wide { "--system" } else { "--user" }]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        cmd.extend(refs);
-        if let Err(d) = blocking(cmd, false).await {
-            return d;
+        What::Snaps(names) => {
+            let mut cmd = vec!["snap".to_string(), "refresh".into(), "--".into()];
+            cmd.extend(names.iter().cloned());
+            let what = plural(names.len(), "snap", "snaps");
+            operation::command(op, &cmd, true, &format!("Updating {what}…")).await
+        }
+        What::Flatpaks { system, refs } => {
+            // Flatpak asks for the password itself for apps installed for everyone, so no pkexec
+            let mut cmd: Vec<String> =
+                ["flatpak", "update", "-y", "--noninteractive", if *system { "--system" } else { "--user" }, "--"]
+                    .map(String::from)
+                    .to_vec();
+            cmd.extend(refs.iter().cloned());
+            let what = plural(refs.len(), "Flatpak item", "Flatpak items");
+            let r = operation::command(op, &cmd, false, &format!("Updating {what}…")).await;
+            op.set_hint("");
+            r
         }
     }
-    Done::Ok
+}
+
+impl Batch {
+    /// The PackageKit ids, for a batch of system packages.
+    pub fn native_ids(&self) -> Option<&[String]> {
+        if let What::Native(ids) = &self.what { Some(ids) } else { None }
+    }
+}
+
+/// A hint shown while a batch runs that may ask for a password by itself.
+pub fn may_ask(b: &Batch) -> bool {
+    matches!(b.what, What::Flatpaks { system: true, .. })
 }

@@ -42,7 +42,7 @@ fn headless(args: &[String]) -> Option<glib::ExitCode> {
             let r = ctx.block_on(async {
                 let ids = packagekit::resolve_installed(std::slice::from_ref(name)).await?;
                 let ids: Vec<String> = ids.into_iter().map(|p| p.id).collect();
-                packagekit::remove(&ids, true, true, |_, _| {}).await
+                packagekit::simulate_remove(&ids, true).await
             });
             match r {
                 Ok(pk) => pk.iter().for_each(|p| println!("{:>2} {}", p.info, p.id)),
@@ -55,7 +55,7 @@ fn headless(args: &[String]) -> Option<glib::ExitCode> {
         "--simulate-update" => {
             let r = ctx.block_on(async {
                 let ids: Vec<String> = packagekit::get_updates().await?.into_iter().map(|p| p.id).collect();
-                packagekit::update(&ids, true, |_, _| {}).await
+                packagekit::simulate_update(&ids).await
             });
             match r {
                 Ok(pk) => pk.iter().for_each(|p| println!("{:>2} {}", p.info, p.id)),

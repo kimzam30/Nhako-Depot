@@ -77,6 +77,9 @@ const GENERIC: &[&str] = &[
     "sensible-browser",
 ];
 
+/// Options of `flatpak run` and `snap run` whose value can follow as its own argument.
+const RUN_VALUE_OPTS: &[&str] = &["--command", "--branch", "--arch", "--runtime", "--runtime-version", "--cwd"];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Flatpak(String),
@@ -112,9 +115,20 @@ pub fn target(argv: &[String], search: &[PathBuf]) -> Option<Target> {
     let prog = argv.get(i)?;
     let rest = &argv[i + 1..];
     let b = base(prog);
+    // the first plain argument after `run`, skipping options and the values of options that
+    // take one as a separate argument (`flatpak run --command foo org.x.Y`)
     let after_run = || {
         let r = rest.iter().position(|a| a == "run")?;
-        rest[r + 1..].iter().find(|a| !a.starts_with('-')).cloned()
+        let mut args = rest[r + 1..].iter();
+        while let Some(a) = args.next() {
+            if !a.starts_with('-') {
+                return Some(a.clone());
+            }
+            if RUN_VALUE_OPTS.contains(&a.as_str()) {
+                args.next();
+            }
+        }
+        None
     };
     if b == "flatpak"
         && let Some(app) = after_run()
@@ -183,9 +197,19 @@ pub fn search_path(home: &Path) -> Vec<PathBuf> {
             v.push(d);
         }
     }
-    let lb = home.join(".local/bin");
-    if !v.contains(&lb) {
-        v.push(lb);
+    // Depot started from the app menu may have a shorter PATH than the user's terminal, so add the
+    // usual personal folders too; otherwise their launchers would look broken
+    for d in [".local/bin", "bin", ".cargo/bin", "go/bin", ".nix-profile/bin", ".local/share/flatpak/exports/bin"] {
+        let d = home.join(d);
+        if !v.contains(&d) {
+            v.push(d);
+        }
+    }
+    for d in ["/var/lib/flatpak/exports/bin", "/nix/var/nix/profiles/default/bin", "/usr/local/games"] {
+        let d = PathBuf::from(d);
+        if !v.contains(&d) {
+            v.push(d);
+        }
     }
     v
 }
@@ -209,6 +233,10 @@ mod tests {
             Some(Target::Snap("code".into()))
         );
         assert_eq!(target(&a(&["snap", "run", "spotify"]), &[]), Some(Target::Snap("spotify".into())));
+        assert_eq!(
+            target(&a(&["flatpak", "run", "--command", "tool", "org.x.Y"]), &[]),
+            Some(Target::Flatpak("org.x.Y".into()))
+        );
         assert_eq!(
             target(&a(&["env", "-u", "GTK_THEME", "nice", "-n", "5", "snap", "run", "x"]), &[]),
             Some(Target::Snap("x".into()))

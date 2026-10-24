@@ -58,7 +58,7 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
         op.add_css_class("suggested-action");
         op.add_css_class("pill");
         let (st, desktop) = (st.clone(), desktop.clone());
-        op.connect_clicked(move |_| launch(&st, &desktop));
+        op.connect_clicked(move |b| launch(&st, &desktop, b));
         btns.append(&op);
     }
     let rm = gtk::Button::with_label(remove_label(&p));
@@ -67,7 +67,7 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
     match &p.blocked {
         None => {
             let (st, p) = (st.clone(), p.clone());
-            rm.connect_clicked(move |b| remove::start(&st, &p, b));
+            rm.connect_clicked(move |b| remove::start(&st, vec![(*p).clone()], Some(b)));
         }
         Some(reason) => {
             rm.set_sensitive(false);
@@ -154,7 +154,15 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
             .build();
         r.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
         let (win, url) = (st.win.clone(), p.homepage.clone());
-        r.connect_activated(move |_| gtk::UriLauncher::new(&url).launch(Some(&win), None::<&gio::Cancellable>, |_| {}));
+        let st2 = st.clone();
+        r.connect_activated(move |_| {
+            let st = st2.clone();
+            gtk::UriLauncher::new(&url).launch(Some(&win), None::<&gio::Cancellable>, move |r| {
+                if r.is_err() {
+                    st.toast("Couldn't open the website. Is a web browser installed?");
+                }
+            })
+        });
         grp.add(&r);
     }
     bx.append(&grp);
@@ -168,9 +176,24 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
         });
     }
 
-    tv.set_content(Some(
-        &gtk::ScrolledWindow::builder().child(&adw::Clamp::builder().maximum_size(760).child(&bx).build()).build(),
+    // on a phone-sized window the icon sits above the title instead of beside it
+    let bin = adw::BreakpointBin::builder()
+        .width_request(360)
+        .height_request(300)
+        .child(
+            &gtk::ScrolledWindow::builder().child(&adw::Clamp::builder().maximum_size(760).child(&bx).build()).build(),
+        )
+        .build();
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        500.0,
+        adw::LengthUnit::Sp,
     ));
+    narrow.add_setter(&top, "orientation", Some(&gtk::Orientation::Vertical.to_value()));
+    narrow.add_setter(&img, "pixel-size", Some(&80.to_value()));
+    narrow.add_setter(&img, "halign", Some(&gtk::Align::Start.to_value()));
+    bin.add_breakpoint(narrow);
+    tv.set_content(Some(&bin));
     st.nav.push(&adw::NavigationPage::new(&tv, &p.title));
 }
 
@@ -208,9 +231,37 @@ fn copies(st: &Rc<State>, p: &Rc<Package>, others: &[Package]) -> adw::Preferenc
     grp
 }
 
-fn launch(st: &State, desktop: &std::path::Path) {
-    let args = [std::ffi::OsStr::new("gio"), "launch".as_ref(), desktop.as_os_str()];
-    if let Err(e) = gio::Subprocess::newv(&args, gio::SubprocessFlags::NONE) {
+/// Start the app from its launcher. The button says "Opening…" for a moment, since apps can
+/// take a while to show their window.
+fn launch(st: &State, desktop: &std::path::Path, button: &gtk::Button) {
+    // the launcher is in an app folder, so the system knows it by its file name; one shadowed by
+    // another file of that name, or outside those folders, is started through `gio launch`
+    let id = desktop.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let known = gio::AppInfo::all().into_iter().find(|a| a.id().is_some_and(|i| i == id));
+    let started = match known {
+        // GDesktopAppInfo's "filename" says which file it was read from
+        Some(app)
+            if app.find_property("filename").is_some()
+                && app.property::<Option<String>>("filename").as_deref().map(std::path::Path::new) == Some(desktop) =>
+        {
+            app.launch(&[], Some(&button.display().app_launch_context())).map_err(|e| e.message().to_string())
+        }
+        _ => {
+            let args = [std::ffi::OsStr::new("gio"), "launch".as_ref(), desktop.as_os_str()];
+            gio::Subprocess::newv(&args, gio::SubprocessFlags::NONE).map(|_| ()).map_err(|e| e.message().to_string())
+        }
+    };
+    if let Err(e) = started {
         st.toast(&format!("Couldn't open the app: {e}"));
+        return;
     }
+    button.set_label("Opening…");
+    button.set_sensitive(false);
+    let b = button.downgrade();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+        if let Some(b) = b.upgrade() {
+            b.set_label("Open");
+            b.set_sensitive(true);
+        }
+    });
 }

@@ -30,6 +30,9 @@ pub struct Env {
     pub flatpak: bool,
     pub flatpak_share: Vec<PathBuf>,
     pub cache_dir: Option<PathBuf>,
+    /// The distro family from `/etc/os-release` (`ID` and `ID_LIKE`), which decides between
+    /// package databases when more than one is present.
+    pub os_like: Vec<String>,
 }
 
 impl Env {
@@ -59,13 +62,22 @@ impl Env {
                 "/var/lib/flatpak/exports/share".into(),
             ],
             cache_dir: Some(cache.join("depot")),
+            os_like: std::fs::read_to_string("/etc/os-release").map(|t| parse_os_like(&t)).unwrap_or_default(),
             home,
         }
     }
 }
 
+/// `ID` and `ID_LIKE` from os-release, as a list of lowercase words.
+pub fn parse_os_like(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("ID=").or_else(|| l.strip_prefix("ID_LIKE=")))
+        .flat_map(|v| v.trim_matches(['"', '\'']).split_whitespace().map(str::to_lowercase).collect::<Vec<_>>())
+        .collect()
+}
+
 /// The distro's own package manager, if Depot can read it. Only one is used, so a stray
-/// `rpm` on Ubuntu doesn't count.
+/// `rpm` on Ubuntu or `dpkg` on Arch doesn't count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Native {
     Dpkg,
@@ -75,14 +87,27 @@ enum Native {
 
 impl Native {
     fn detect(env: &Env) -> Option<Native> {
-        if env.dpkg_dir.join("status").exists() {
-            Some(Native::Dpkg)
-        } else if env.pacman_dir.join("local").is_dir() {
-            Some(Native::Pacman)
-        } else if env.rpm_db.as_deref().is_some_and(Path::is_dir) {
-            Some(Native::Rpm)
-        } else {
-            None
+        let present: Vec<Native> = [
+            (Native::Dpkg, env.dpkg_dir.join("status").exists()),
+            (Native::Pacman, env.pacman_dir.join("local").is_dir()),
+            (Native::Rpm, env.rpm_db.as_deref().is_some_and(Path::is_dir)),
+        ]
+        .into_iter()
+        .filter_map(|(n, here)| here.then_some(n))
+        .collect();
+        // when several are installed, the one the distro family uses wins
+        present
+            .iter()
+            .copied()
+            .find(|n| n.families().iter().any(|f| env.os_like.iter().any(|o| o == f)))
+            .or_else(|| present.first().copied())
+    }
+
+    fn families(self) -> &'static [&'static str] {
+        match self {
+            Native::Dpkg => &["debian", "ubuntu"],
+            Native::Pacman => &["arch", "archlinux"],
+            Native::Rpm => &["fedora", "rhel", "centos", "suse", "opensuse", "mageia"],
         }
     }
 
@@ -102,7 +127,7 @@ impl Native {
         }
     }
 
-    fn owners(self, env: &Env, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
+    fn owners(self, env: &Env, wanted: &HashSet<PathBuf>) -> (HashMap<PathBuf, String>, Option<String>) {
         let cache = |name: &str| env.cache_dir.as_ref().map(|d| d.join(name));
         match self {
             Native::Dpkg => dpkg::owners(&env.dpkg_dir, cache("dpkg-owners").as_deref(), wanted),
@@ -146,11 +171,11 @@ fn web_app(argv: &[String]) -> bool {
 fn claim(l: &Launcher, env: &Env) -> Claim {
     let path = &l.entry.path;
     if path.starts_with(&env.snap_desktop_dir) {
-        let id = l.entry.id.trim_end_matches(".desktop");
+        let id = l.entry.id.strip_suffix(".desktop").unwrap_or(&l.entry.id);
         return Claim::Snap(id.split('_').next().unwrap_or(id).to_string());
     }
     if flatpak::is_export(path) {
-        return Claim::Flatpak(l.entry.id.trim_end_matches(".desktop").to_string());
+        return Claim::Flatpak(l.entry.id.strip_suffix(".desktop").unwrap_or(&l.entry.id).to_string());
     }
     let argv = l.entry.argv();
     let target = exec::target(&argv, &env.path);
@@ -220,7 +245,7 @@ fn manual_package(
     broken: bool,
 ) -> Package {
     let e = &l.entry;
-    let base = e.id.trim_end_matches(".desktop");
+    let base = e.id.strip_suffix(".desktop").unwrap_or(&e.id);
     let mut p = Package::new(Kind::Manual, base);
     p.role = Role::App;
     p.user_installed = true;
@@ -250,9 +275,6 @@ fn manual_package(
         (None, Some(prog)) => prog.to_string_lossy().into_owned(),
         (None, None) => e.exec.clone(),
     };
-    if let Some(d) = &plan.appdir {
-        p.version = manual::version(d);
-    }
     if !e.path.starts_with(&env.home) {
         p.blocked = Some(
             "This launcher is in a system folder and wasn't installed by a package manager, so Depot can't remove it safely."
@@ -341,7 +363,14 @@ pub fn scan(env: &Env) -> Inventory {
             .filter_map(|c| if let Claim::Files(f, _, _) = c { Some(f.iter().map(|(p, _)| p.clone())) } else { None })
             .flatten()
             .collect();
-        native.owners(env, &wanted)
+        let (owners, error) = native.owners(env, &wanted);
+        if let Some(e) = error {
+            inv.warnings.push(format!(
+                "{}: couldn't tell which apps came from them ({e}). They may show up as manual installs; press Refresh to try again.",
+                native.label()
+            ));
+        }
+        owners
     } else {
         HashMap::new()
     };
@@ -429,6 +458,12 @@ pub fn scan(env: &Env) -> Inventory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn os_release_family() {
+        let t = "NAME=\"Zorin OS\"\nID=zorin\nID_LIKE=\"ubuntu debian\"\nVERSION_ID=18\n";
+        assert_eq!(super::parse_os_like(t), ["zorin", "ubuntu", "debian"]);
+    }
+
     #[test]
     fn flatpak_child_needs_a_name_boundary() {
         assert!(super::flatpak_child("org.x.App.Tool", "org.x.App"));

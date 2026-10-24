@@ -13,6 +13,7 @@ PREFIX="${PREFIX:-$HOME/.local}"
 BIN="$PREFIX/bin/depot"
 APPS="$PREFIX/share/applications"
 ICONS="$PREFIX/share/icons/hicolor"
+METAINFO="$PREFIX/share/metainfo"
 
 cd "$(dirname "$0")"
 
@@ -22,7 +23,7 @@ refresh_menus() {
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -f "$BIN" "$APPS/$APP_ID.desktop" "$ICONS/scalable/apps/$APP_ID.svg"
+    rm -f "$BIN" "$APPS/$APP_ID.desktop" "$ICONS/scalable/apps/$APP_ID.svg" "$METAINFO/$APP_ID.metainfo.xml"
     rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/depot"
     refresh_menus
     echo "Depot has been removed."
@@ -54,6 +55,8 @@ fi
 
 install -Dm755 target/release/depot "$BIN"
 install -Dm644 "data/icons/hicolor/scalable/apps/$APP_ID.svg" "$ICONS/scalable/apps/$APP_ID.svg"
+# lets software centres such as GNOME Software show Depot's description and release notes
+install -Dm644 "data/$APP_ID.metainfo.xml" "$METAINFO/$APP_ID.metainfo.xml"
 mkdir -p "$APPS"
 # point the launcher at the installed file so it works even if ~/.local/bin isn't on PATH
 sed "s|^Exec=depot\$|Exec=$BIN|" "data/$APP_ID.desktop" > "$APPS/$APP_ID.desktop"

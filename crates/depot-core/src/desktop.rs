@@ -32,17 +32,38 @@ fn locale_suffixes() -> &'static [String] {
             .iter()
             .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
             .unwrap_or_default();
-        let base = raw.split(['.', '@']).next().unwrap_or("");
-        if base.is_empty() || base == "C" || base == "POSIX" {
-            return Vec::new();
-        }
-        let mut v = vec![base.to_string()];
-        if let Some((lang, _)) = base.split_once('_') {
-            v.push(lang.to_string());
-        }
-        v
+        locale_order(&raw)
     })
 }
+
+/// `sr_RS.UTF-8@latin` → `sr_RS@latin`, `sr_RS`, `sr@latin`, `sr`: the order the Desktop Entry
+/// spec matches `Name[…]` keys in.
+fn locale_order(raw: &str) -> Vec<String> {
+    let (main, modifier) = match raw.split_once('@') {
+        Some((m, md)) => (m, Some(md)),
+        None => (raw, None),
+    };
+    let base = main.split('.').next().unwrap_or("");
+    if base.is_empty() || base == "C" || base == "POSIX" {
+        return Vec::new();
+    }
+    let lang = base.split_once('_').map(|(l, _)| l);
+    let mut v = Vec::new();
+    if let Some(m) = modifier {
+        v.push(format!("{base}@{m}"));
+    }
+    v.push(base.to_string());
+    if let Some(l) = lang {
+        if let Some(m) = modifier {
+            v.push(format!("{l}@{m}"));
+        }
+        v.push(l.to_string());
+    }
+    v
+}
+
+/// Launchers bigger than this aren't read.
+const MAX_SIZE: u64 = 256 * 1024;
 
 fn list(v: &str) -> Vec<String> {
     v.split(';').filter(|s| !s.is_empty()).map(str::to_string).collect()
@@ -50,6 +71,11 @@ fn list(v: &str) -> Vec<String> {
 
 impl DesktopEntry {
     pub fn load(path: &Path, id: String) -> Option<Self> {
+        // a launcher is a small text file; a link to a pipe or device would hang the scan
+        let m = std::fs::metadata(path).ok()?;
+        if !m.is_file() || m.len() > MAX_SIZE {
+            return None;
+        }
         let bytes = std::fs::read(path).ok()?;
         Some(Self::parse(&String::from_utf8_lossy(&bytes), path.to_path_buf(), id))
     }
@@ -212,6 +238,13 @@ pub fn split_exec(exec: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locale_modifiers() {
+        assert_eq!(locale_order("sr_RS.UTF-8@latin"), ["sr_RS@latin", "sr_RS", "sr@latin", "sr"]);
+        assert_eq!(locale_order("de_DE.UTF-8"), ["de_DE", "de"]);
+        assert!(locale_order("C.UTF-8").is_empty());
+    }
 
     #[test]
     fn exec_quoting_and_field_codes() {

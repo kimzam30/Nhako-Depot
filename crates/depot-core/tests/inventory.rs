@@ -84,6 +84,7 @@ impl Fake {
             flatpak: false,
             flatpak_share: vec![],
             cache_dir: Some(self.p("home/.cache/depot")),
+            os_like: vec![],
         }
     }
 }
@@ -335,4 +336,33 @@ fn pacman_packages_own_their_launchers() {
     assert!(!htop.user_installed);
     let glibc = inv.packages.iter().find(|p| p.id == "glibc").unwrap();
     assert!(glibc.blocked.is_some(), "HoldPkg packages can't be removed");
+}
+
+/// A stray dpkg database on Arch must not hide every pacman package.
+#[test]
+fn distro_family_picks_the_package_database() {
+    let f = Fake::new("family");
+    let bin = f.exe("usr/lib/firefox/firefox");
+    let own = f.launcher("usr/share/applications/firefox.desktop", &format!("Name=Firefox\nExec={}", bin.display()));
+    f.pacman("firefox", &[&bin, &own], true);
+    f.deb("dpkg", &[]);
+    let mut env = f.env();
+    env.os_like = vec!["arch".into()];
+    let inv = scan(&env);
+    assert_eq!(find(&inv.packages, "Firefox")[0].kind, Kind::Pacman);
+    assert!(inv.packages.iter().all(|p| p.kind != Kind::Deb));
+}
+
+/// A program in ~/.cargo/bin is installed, even when Depot was started with a short PATH.
+#[test]
+fn home_program_folders_count_as_installed() {
+    let f = Fake::new("homebin");
+    f.exe("home/.cargo/bin/mytool");
+    f.launcher("home/.local/share/applications/mytool.desktop", "Name=My Tool\nExec=mytool");
+    let mut env = f.env();
+    env.path = depot_core::exec::search_path(&f.p("home"));
+    let inv = scan(&env);
+    let t = find(&inv.packages, "My Tool");
+    assert_eq!(t.len(), 1);
+    assert!(!t[0].broken, "its program is in ~/.cargo/bin");
 }

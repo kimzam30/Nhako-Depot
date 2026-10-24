@@ -5,6 +5,7 @@ use crate::owners;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn native_arch() -> &'static str {
     match std::env::consts::ARCH {
@@ -121,18 +122,29 @@ pub fn load(dpkg_dir: &Path, apt_states: &Path) -> Result<Vec<Package>, String> 
 }
 
 /// Find which package owns each wanted path by scanning dpkg's file lists in parallel.
-pub fn scan_owners(info_dir: &Path, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
-    let lists: Vec<PathBuf> = match std::fs::read_dir(info_dir) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "list")).collect(),
-        Err(_) => return HashMap::new(),
-    };
+pub fn scan_owners(info_dir: &Path, wanted: &HashSet<PathBuf>) -> Result<HashMap<PathBuf, String>, String> {
     if wanted.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
+    let lists: Vec<PathBuf> = std::fs::read_dir(info_dir)
+        .map_err(|e| format!("Couldn't read {}: {e}", info_dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "list"))
+        .collect();
     let keys: HashSet<&[u8]> = wanted.iter().map(|p| p.as_os_str().as_bytes()).collect();
     let native = format!(":{}", native_arch());
-    let mut found = owners::parallel(&lists, |f| {
-        let Ok(bytes) = std::fs::read(f) else { return Vec::new() };
+    let failed = AtomicBool::new(false);
+    let found = owners::parallel(&lists, |f| {
+        let bytes = match std::fs::read(f) {
+            Ok(b) => b,
+            // removed by a dpkg run in the meantime: that package no longer owns anything
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(_) => {
+                failed.store(true, Ordering::Relaxed);
+                return Vec::new();
+            }
+        };
         let stem = f.file_stem().unwrap_or_default().to_string_lossy();
         let owner = stem.strip_suffix(native.as_str()).unwrap_or(&stem).to_string();
         bytes
@@ -141,17 +153,18 @@ pub fn scan_owners(info_dir: &Path, wanted: &HashSet<PathBuf>) -> HashMap<PathBu
             .map(|line| (PathBuf::from(std::ffi::OsStr::from_bytes(line)), owner.clone()))
             .collect()
     });
-    // Directories and diverted files can appear in several lists; make the pick stable.
-    found.sort();
-    let mut out = HashMap::new();
-    for (p, o) in found {
-        out.entry(p).or_insert(o);
+    if failed.into_inner() {
+        return Err("Some of dpkg's file lists couldn't be read.".into());
     }
-    out
+    Ok(owners::first_owner(found))
 }
 
 /// [`scan_owners`] with an on-disk cache that stays valid until dpkg's database changes.
-pub fn owners(dpkg_dir: &Path, cache: Option<&Path>, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
+pub fn owners(
+    dpkg_dir: &Path,
+    cache: Option<&Path>,
+    wanted: &HashSet<PathBuf>,
+) -> (HashMap<PathBuf, String>, Option<String>) {
     let info = dpkg_dir.join("info");
     let stamp =
         format!("depot-dpkg-owners-v1 {} {}", owners::mtime_ns(&dpkg_dir.join("status")), owners::mtime_ns(&info));

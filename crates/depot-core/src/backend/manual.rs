@@ -46,6 +46,11 @@ pub fn appdir(program: &Path, roots: &[PathBuf], others: &[PathBuf]) -> Option<P
         for c in &comps[..comps.len().saturating_sub(1)] {
             dir.push(c);
             if !groups_apps(&dir, &real, others) {
+                // a source checkout with a launcher pointing into its build output is someone's
+                // project, not an installed app, so it's never offered for the Trash as a whole
+                if dir.join(".git").exists() {
+                    return None;
+                }
                 return dir.is_dir().then_some(dir);
             }
         }
@@ -105,7 +110,7 @@ pub fn plan(
     let mut data = Vec::new();
     if let Some(dir) = &appdir {
         files.push(dir.clone());
-        let base = entry.id.trim_end_matches(".desktop");
+        let base = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
         let autostart = home.join(".config/autostart").join(&entry.id);
         if let Some(a) = DesktopEntry::load(&autostart, entry.id.clone())
             && let Some(exec::Target::Program { path: Some(p), .. }) = exec::target(&a.argv(), &[])
@@ -166,11 +171,6 @@ fn find_icons(dir: &Path, icon: &str, depth: u8, out: &mut Vec<PathBuf>) {
             out.push(p);
         }
     }
-}
-
-/// Version written by tarball installers that leave a marker file in the app folder.
-pub fn version(appdir: &Path) -> String {
-    std::fs::read_to_string(appdir.join(".blip-tarball-install")).map(|s| s.trim().to_string()).unwrap_or_default()
 }
 
 /// Total size of a folder, without following symlinks.

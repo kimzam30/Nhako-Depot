@@ -3,8 +3,6 @@
 use adw::prelude::*;
 use depot_core::{Kind, Package, Role};
 use gtk::{gio, glib, pango};
-use std::cell::Cell;
-use std::rc::Rc;
 
 pub fn label(text: &str, classes: &[&str]) -> gtk::Label {
     let l = gtk::Label::builder().label(text).xalign(0.0).build();
@@ -92,89 +90,13 @@ pub fn gicon_for(icon: Option<&str>, app: bool) -> gio::Icon {
     }
 }
 
-/// A modal dialog with a status line and a progress bar, for work the user has to wait for.
-pub struct Progress {
-    dialog: adw::Dialog,
-    status: gtk::Label,
-    bar: gtk::ProgressBar,
-    pulsing: Rc<Cell<bool>>,
-    /// Set once the dialog closes, which stops the pulse timer.
-    closed: Rc<Cell<bool>>,
-}
-
-impl Progress {
-    pub fn show(parent: &impl IsA<gtk::Widget>, title: &str, hint: &str) -> Rc<Progress> {
-        let dialog = adw::Dialog::builder().content_width(360).can_close(false).build();
-        let bx = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
-            .margin_top(28)
-            .margin_bottom(28)
-            .margin_start(24)
-            .margin_end(24)
-            .build();
-        let heading = label(title, &["title-4"]);
-        heading.set_halign(gtk::Align::Center);
-        bx.append(&heading);
-        let status = wrapped("", &["dim-label"]);
-        status.set_justify(gtk::Justification::Center);
-        status.set_xalign(0.5);
-        bx.append(&status);
-        let bar = gtk::ProgressBar::new();
-        bx.append(&bar);
-        if !hint.is_empty() {
-            let h = wrapped(hint, &["caption", "dim-label"]);
-            h.set_justify(gtk::Justification::Center);
-            h.set_xalign(0.5);
-            bx.append(&h);
-        }
-        dialog.set_child(Some(&bx));
-        dialog.present(Some(parent));
-        let pulsing = Rc::new(Cell::new(true));
-        let closed = Rc::new(Cell::new(false));
-        let (b, p, c) = (bar.clone(), pulsing.clone(), closed.clone());
-        glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
-            if c.get() {
-                return glib::ControlFlow::Break;
-            }
-            if p.get() {
-                b.pulse();
-            }
-            glib::ControlFlow::Continue
-        });
-        Rc::new(Progress { dialog, status, bar, pulsing, closed })
-    }
-
-    /// Update the status line (empty text keeps the old one) and the bar (`None` = unknown, pulse).
-    pub fn set(&self, text: &str, fraction: Option<f64>) {
-        if !text.is_empty() {
-            self.status.set_text(text);
-        }
-        match fraction {
-            Some(f) => {
-                self.pulsing.set(false);
-                self.bar.set_fraction(f.clamp(0.0, 1.0));
-            }
-            None => self.pulsing.set(true),
-        }
-    }
-
-    /// Close once the dialog has finished opening (closing an opening dialog is ignored).
-    pub async fn close(&self, opened: std::time::Instant) {
-        if let Some(wait) = std::time::Duration::from_millis(400).checked_sub(opened.elapsed()) {
-            glib::timeout_future(wait).await;
-        }
-        self.closed.set(true);
-        self.dialog.force_close();
-    }
-}
-
 pub fn size_text(n: u64) -> String {
     if n == 0 { String::new() } else { glib::format_size(n).to_string() }
 }
 
-/// A grid card. Children, in order: icon, title, summary, badge row.
-pub fn card() -> gtk::Box {
+/// A grid card: a box (icon, title, summary, badge row) with a tick box over its top-right
+/// corner for selection mode.
+pub fn card() -> gtk::Overlay {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
     b.add_css_class("card");
     b.add_css_class("pkg-card");
@@ -190,11 +112,32 @@ pub fn card() -> gtk::Box {
     summ.set_vexpand(true);
     b.append(&summ);
     b.append(&gtk::Box::new(gtk::Orientation::Horizontal, 8));
-    b
+    let o = gtk::Overlay::builder().child(&b).build();
+    let tick = gtk::CheckButton::builder()
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .margin_top(10)
+        .margin_end(10)
+        .visible(false)
+        // clicks go to the card, which toggles the selection
+        .can_target(false)
+        .can_focus(false)
+        .build();
+    tick.add_css_class("card-tick");
+    o.add_overlay(&tick);
+    o
+}
+
+/// The parts of a card made by [`card`].
+pub fn card_parts(card: &gtk::Overlay) -> (gtk::Box, gtk::CheckButton) {
+    let b = card.child().and_downcast::<gtk::Box>().expect("card box");
+    let tick = b.next_sibling().and_downcast::<gtk::CheckButton>().expect("tick");
+    (b, tick)
 }
 
 /// Fill a card for `p`; `others` are other copies of the same app, shown as extra source badges.
-pub fn bind_card(card: &gtk::Widget, p: &Package, others: &[&Package]) {
+pub fn bind_card(card: &gtk::Overlay, p: &Package, others: &[&Package]) {
+    let (card, _) = card_parts(card);
     let img = card.first_child().and_downcast::<gtk::Image>().expect("icon");
     let title = img.next_sibling().and_downcast::<gtk::Label>().expect("title");
     let summ = title.next_sibling().and_downcast::<gtk::Label>().expect("summary");

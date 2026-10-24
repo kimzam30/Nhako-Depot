@@ -40,7 +40,9 @@ fn rpm_value(v: &str) -> &str {
 
 /// Packages from `rpm -qa --queryformat FORMAT` output. `protected` names packages the system needs.
 pub fn parse(text: &str, protected: &HashSet<String>) -> Vec<Package> {
-    let mut out = Vec::new();
+    let mut out: Vec<Package> = Vec::new();
+    // several versions of one package can be installed side by side (kernels); they're one card
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for rec in text.split(RECORD).map(|r| r.trim_start_matches('\n')).filter(|r| !r.is_empty()) {
         let (head, desc) = rec.split_once('\n').unwrap_or((rec, ""));
         let f: Vec<&str> = head.split('\t').map(rpm_value).collect();
@@ -49,7 +51,15 @@ pub fn parse(text: &str, protected: &HashSet<String>) -> Vec<Package> {
         if name.is_empty() || name == "gpg-pubkey" {
             continue;
         }
-        let mut p = Package::new(Kind::Rpm, pkg_id(name, arch));
+        let id = pkg_id(name, arch);
+        if let Some(&i) = seen.get(&id) {
+            let q = &mut out[i];
+            q.version = format!("{}, {version}", q.version);
+            q.size += size.parse::<u64>().unwrap_or(0);
+            continue;
+        }
+        seen.insert(id.clone(), out.len());
+        let mut p = Package::new(Kind::Rpm, id);
         p.name = name.to_string();
         p.arch = arch.to_string();
         p.version = version.to_string();
@@ -99,40 +109,43 @@ pub fn load(db: &Path) -> Result<Vec<Package>, String> {
     if !db.is_dir() {
         return Ok(Vec::new());
     }
-    let text = match rpm(&["-qa", "--queryformat", FORMAT]) {
-        Err(e) if e.starts_with("Couldn't run") => return Ok(Vec::new()),
-        r => r?,
-    };
+    let text = rpm(&["-qa", "--queryformat", FORMAT])?;
     Ok(parse(&text, &protected_names()))
 }
 
 /// Owners of the wanted paths from `rpm -qa` file-list output (`path<TAB>name` per line).
 pub fn parse_file_owners(text: &str, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
     let keys: HashSet<&str> = wanted.iter().filter_map(|p| p.to_str()).collect();
-    let mut found: Vec<(PathBuf, String)> = text
-        .lines()
-        .filter_map(|l| l.split_once('\t'))
-        .filter(|(p, _)| keys.contains(p))
-        .map(|(p, n)| (PathBuf::from(p), n.to_string()))
-        .collect();
-    found.sort();
-    let mut out = HashMap::new();
-    for (p, o) in found {
-        out.entry(p).or_insert(o);
-    }
-    out
+    owners::first_owner(
+        text.lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(p, _)| keys.contains(p))
+            .map(|(p, n)| (PathBuf::from(p), n.to_string()))
+            .collect(),
+    )
 }
 
 /// Which package owns each wanted path. rpm can only list every file of every package, which
 /// takes a second or two, so the answers are cached until the database changes.
-pub fn owners(db: &Path, cache: Option<&Path>, wanted: &HashSet<PathBuf>) -> HashMap<PathBuf, String> {
-    let stamp = format!("depot-rpm-owners-v1 {} {}", owners::mtime_ns(db), owners::mtime_ns(&db.join("rpmdb.sqlite")));
-    owners::cached(cache, &stamp, wanted, |misses| {
+pub fn owners(
+    db: &Path,
+    cache: Option<&Path>,
+    wanted: &HashSet<PathBuf>,
+) -> (HashMap<PathBuf, String>, Option<String>) {
+    owners::cached(cache, &stamp(db), wanted, |misses| {
         // owners are package names, not dnf ids; multilib copies of one name own the same files
-        rpm(&["-qa", "--queryformat", "[%{FILENAMES}\\t%{NAME}\\n]"])
-            .map(|t| parse_file_owners(&t, misses))
-            .unwrap_or_default()
+        rpm(&["-qa", "--queryformat", "[%{FILENAMES}\\t%{NAME}\\n]"]).map(|t| parse_file_owners(&t, misses))
     })
+}
+
+/// Identifies the database state. Fedora's rpm writes `rpmdb.sqlite`; openSUSE's ndb backend
+/// rewrites `Packages.db` in place, so the folder's own time doesn't change there.
+fn stamp(db: &Path) -> String {
+    let times: Vec<String> = ["", "rpmdb.sqlite", "rpmdb.sqlite-wal", "Packages.db", "Packages"]
+        .iter()
+        .map(|f| owners::mtime_ns(&db.join(f)).to_string())
+        .collect();
+    format!("depot-rpm-owners-v2 {}", times.join(" "))
 }
 
 #[cfg(test)]
@@ -158,6 +171,18 @@ mod tests {
         }
         assert!(p[1].homepage.is_empty() && p[1].description.is_empty());
         assert!(p[1].blocked.is_some());
+    }
+
+    #[test]
+    fn several_versions_are_one_package() {
+        let arch = native_arch();
+        let t = format!(
+            "@@depot@@\nkernel\t6.8-1\t{arch}\t10\t\t\t\tLinux\n\n@@depot@@\nkernel\t6.9-1\t{arch}\t20\t\t\t\tLinux\n\n"
+        );
+        let p = parse(&t, &HashSet::new());
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].version, "6.8-1, 6.9-1");
+        assert_eq!(p[0].size, 30);
     }
 
     #[test]
