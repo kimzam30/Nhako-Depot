@@ -11,6 +11,7 @@ pub enum Kind {
     Pacman,
     Snap,
     Flatpak,
+    AppImage,
     Manual,
 }
 
@@ -18,6 +19,11 @@ impl Kind {
     /// The distro's own package format (Deb, RPM or Pacman), managed through PackageKit.
     pub fn is_native(self) -> bool {
         matches!(self, Kind::Deb | Kind::Rpm | Kind::Pacman)
+    }
+
+    /// Removed by moving its files to the Trash rather than through a package manager.
+    pub fn trashes(self) -> bool {
+        matches!(self, Kind::Manual | Kind::AppImage)
     }
 
     /// Short text for the badge on a card.
@@ -28,6 +34,7 @@ impl Kind {
             Kind::Pacman => "Pacman",
             Kind::Snap => "Snap",
             Kind::Flatpak => "Flatpak",
+            Kind::AppImage => "AppImage",
             Kind::Manual => "Manual",
         }
     }
@@ -40,6 +47,7 @@ impl Kind {
             Kind::Pacman => "pacman",
             Kind::Snap => "snap",
             Kind::Flatpak => "flatpak",
+            Kind::AppImage => "appimage",
             Kind::Manual => "manual",
         }
     }
@@ -52,6 +60,7 @@ impl Kind {
             Kind::Pacman => "Pacman package",
             Kind::Snap => "Snap",
             Kind::Flatpak => "Flatpak",
+            Kind::AppImage => "AppImage (a single downloaded file)",
             Kind::Manual => "Manual install (not from a package manager)",
         }
     }
@@ -64,6 +73,7 @@ impl Kind {
             Kind::Pacman => "Installed with pacman, from your system's repositories or the AUR.",
             Kind::Snap => "Installed from the Snap Store. Snaps update themselves.",
             Kind::Flatpak => "Installed with Flatpak, usually from Flathub. Runs in its own sandbox.",
+            Kind::AppImage => "A single downloaded file that runs the app. Removing it moves the file to the Trash.",
             Kind::Manual => {
                 "Installed by hand (downloaded archive, script or launcher), not through a package manager."
             }
@@ -141,6 +151,16 @@ impl Package {
     pub fn new(kind: Kind, id: impl Into<String>) -> Self {
         let id = id.into();
         Package { kind, name: id.clone(), title: id.clone(), id, ..Default::default() }
+    }
+
+    /// Removing it takes the program away too, not only its launcher: always for an AppImage, and
+    /// for a manual install when its own folder is known.
+    pub fn removes_program(&self) -> bool {
+        match self.kind {
+            Kind::AppImage => true,
+            Kind::Manual => self.manual.as_ref().is_some_and(|m| m.appdir.is_some()),
+            _ => false,
+        }
     }
 
     /// Lowercased text matched by search.

@@ -21,7 +21,7 @@
     </p>
     <p>Depot is made for people who are new to Linux:</p>
     <ul>
-      <li>Every app in one place, with a badge saying whether it's a Deb, RPM, Pacman, Snap, Flatpak or manual install</li>
+      <li>Every app in one place, with a badge saying whether it's a Deb, RPM, Pacman, Snap, Flatpak, AppImage or manual install</li>
       <li>One card per app, even when it's installed more than one way</li>
       <li>Tick several apps and uninstall them together, or tick exactly which updates to install</li>
       <li>Before anything is removed, Depot shows exactly what will go with it</li>
@@ -52,6 +52,7 @@
     <keyword>packages</keyword>
     <keyword>snap</keyword>
     <keyword>flatpak</keyword>
+    <keyword>appimage</keyword>
     <keyword>deb</keyword>
   </keywords>
 

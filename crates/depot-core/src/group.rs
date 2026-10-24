@@ -26,7 +26,8 @@ fn rank(k: Kind) -> u8 {
         Kind::Deb | Kind::Rpm | Kind::Pacman => 0,
         Kind::Flatpak => 1,
         Kind::Snap => 2,
-        Kind::Manual => 3,
+        Kind::AppImage => 3,
+        Kind::Manual => 4,
     }
 }
 

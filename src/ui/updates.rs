@@ -199,7 +199,7 @@ fn source(u: &Update) -> &'static str {
         Kind::Deb | Kind::Rpm | Kind::Pacman => "System package",
         Kind::Snap => "Snap",
         Kind::Flatpak => "Flatpak",
-        Kind::Manual => "",
+        Kind::AppImage | Kind::Manual => "",
     }
 }
 

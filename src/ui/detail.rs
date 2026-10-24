@@ -12,7 +12,7 @@ use std::rc::Rc;
 pub fn remove_label(p: &Package) -> &'static str {
     if p.broken {
         "Remove leftover launcher"
-    } else if p.kind == Kind::Manual && p.manual.as_ref().is_none_or(|m| m.appdir.is_none()) {
+    } else if p.kind == Kind::Manual && !p.removes_program() {
         "Remove launcher"
     } else {
         "Uninstall"
@@ -59,6 +59,17 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
         op.add_css_class("pill");
         let (st, desktop) = (st.clone(), desktop.clone());
         op.connect_clicked(move |b| launch(&st, &desktop, b));
+        btns.append(&op);
+    } else if p.kind == Kind::AppImage && executable(&p.location) {
+        // an AppImage with no launcher is started as the program it is
+        let op = gtk::Button::with_label("Open");
+        op.add_css_class("suggested-action");
+        op.add_css_class("pill");
+        let (st, file) = (st.clone(), p.location.clone());
+        op.connect_clicked(move |b| {
+            let started = gio::Subprocess::newv(&[std::ffi::OsStr::new(&file)], gio::SubprocessFlags::NONE);
+            opened(&st, started.map(|_| ()).map_err(|e| e.message().to_string()), b);
+        });
         btns.append(&op);
     }
     let rm = gtk::Button::with_label(remove_label(&p));
@@ -113,7 +124,7 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
         grp.add(&size_row);
     }
     let mut rows: Vec<(&str, String)> =
-        vec![(if p.kind == Kind::Manual { "Launcher" } else { "Package name" }, p.id.clone())];
+        vec![(if p.kind.trashes() { "Launcher" } else { "Package name" }, p.id.clone())];
     match p.kind {
         Kind::Snap => rows.extend([
             ("Publisher", p.publisher.clone()),
@@ -126,6 +137,13 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
             ("Branch", p.revision.clone()),
         ]),
         Kind::Manual => rows.push(("Location", p.location.clone())),
+        Kind::AppImage => {
+            // a loose AppImage has no launcher: its id is the file itself
+            if p.desktop.is_none() {
+                rows.clear();
+            }
+            rows.push(("File", p.location.clone()));
+        }
         Kind::Rpm => rows.push(("Group", p.section.clone())),
         Kind::Deb | Kind::Pacman => {
             rows.push((if p.kind == Kind::Deb { "Section" } else { "Groups" }, p.section.clone()));
@@ -251,6 +269,16 @@ fn launch(st: &State, desktop: &std::path::Path, button: &gtk::Button) {
             gio::Subprocess::newv(&args, gio::SubprocessFlags::NONE).map(|_| ()).map_err(|e| e.message().to_string())
         }
     };
+    opened(st, started, button);
+}
+
+fn executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Show on `button` that the app is starting, or say why it couldn't.
+fn opened(st: &State, started: Result<(), String>, button: &gtk::Button) {
     if let Err(e) = started {
         st.toast(&format!("Couldn't open the app: {e}"));
         return;

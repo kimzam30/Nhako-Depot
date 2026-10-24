@@ -26,6 +26,7 @@
 .badge-pacman { background: alpha(#1793d1, .18); color: #1793d1; }
 .badge-aur { background: alpha(#9141ac, .18); color: #9141ac; }
 .badge-flatpak { background: alpha(#4a90d9, .18); color: #4a90d9; }
+.badge-appimage { background: alpha(#0d9488, .18); color: #0d9488; }
 .badge-manual { background: alpha(#2ec27e, .18); color: #2ec27e; }
 .badge-sys { background: alpha(currentColor, .10); }
 .badge-broken { background: alpha(#e5a50a, .20); color: #c88800; }

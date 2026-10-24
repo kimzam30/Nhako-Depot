@@ -34,6 +34,15 @@ impl Fake {
         p
     }
 
+    /// A file carrying the AppImage mark, ready to run.
+    fn appimage(&self, rel: &str) -> PathBuf {
+        let p = self.p(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, b"\x7fELF\x02\x01\x01\x00AI\x02 squashfs follows").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
     fn deb(&self, name: &str, files: &[&Path]) {
         let list: String = files.iter().map(|f| format!("{}\n", f.display())).collect();
         self.write(&format!("var/lib/dpkg/info/{name}.list"), &list);
@@ -365,4 +374,88 @@ fn home_program_folders_count_as_installed() {
     let t = find(&inv.packages, "My Tool");
     assert_eq!(t.len(), 1);
     assert!(!t[0].broken, "its program is in ~/.cargo/bin");
+}
+
+/// An AppImage in ~/Applications with a launcher: one AppImage card whose removal takes the file
+/// too, not just the launcher, and no second card for the file itself.
+#[test]
+fn appimage_with_a_launcher() {
+    let f = Fake::new("appimage-launcher");
+    let file = f.appimage("home/Applications/Foo-1.2-x86_64.AppImage");
+    let link = f.p("home/.local/bin/foo");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    let own = f.launcher(
+        "home/.local/share/applications/foo.desktop",
+        &format!("Name=Foo Editor\nExec={} %F", file.display()),
+    );
+    let settings = f.p("home/.config/foo");
+    fs::create_dir_all(&settings).unwrap();
+
+    let inv = scan(&f.env());
+    let all: Vec<&Package> = inv.packages.iter().filter(|p| p.kind == Kind::AppImage).collect();
+    assert_eq!(all.len(), 1, "{all:#?}");
+    let p = all[0];
+    assert_eq!(p.title, "Foo Editor");
+    assert_eq!(p.version, "1.2");
+    assert!(p.blocked.is_none() && p.removes_program());
+    let plan = p.manual.as_ref().unwrap();
+    for want in [&own, &file, &link] {
+        assert!(plan.files.contains(want), "{want:?} missing from {:#?}", plan.files);
+    }
+    assert_eq!(plan.data, vec![settings]);
+}
+
+/// AppImages nobody made a launcher for still show up, once each.
+#[test]
+fn loose_appimages() {
+    let f = Fake::new("appimage-loose");
+    f.appimage("home/Downloads/Bar.AppImage");
+    f.appimage("home/AppImages/tools/Qux-3.0.AppImage");
+    f.write("home/Downloads/notes.txt", "hello");
+    // a plain program named like an AppImage isn't one
+    f.write("home/Downloads/Fake.AppImage", "\x7fELF no mark here");
+
+    let inv = scan(&f.env());
+    let names: Vec<(&str, &str)> = inv
+        .packages
+        .iter()
+        .filter(|p| p.kind == Kind::AppImage)
+        .map(|p| (p.title.as_str(), p.version.as_str()))
+        .collect();
+    assert_eq!(names, vec![("Bar", ""), ("Qux", "3.0")]);
+    let bar = &find(&inv.packages, "Bar")[0];
+    assert_eq!(bar.role, Role::App);
+    assert!(bar.desktop.is_none());
+    assert_eq!(bar.manual.as_ref().unwrap().files, vec![f.p("home/Downloads/Bar.AppImage")]);
+}
+
+/// `appimage-run Foo.AppImage` (NixOS and some app stores) starts the AppImage.
+#[test]
+fn appimage_started_through_appimage_run() {
+    let f = Fake::new("appimage-run");
+    f.exe("usr/bin/appimage-run");
+    let file = f.appimage("home/Applications/Baz.AppImage");
+    f.launcher(
+        "home/.local/share/applications/baz.desktop",
+        &format!("Name=Baz\nExec=appimage-run {}", file.display()),
+    );
+
+    let inv = scan(&f.env());
+    let hits = find(&inv.packages, "Baz");
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert_eq!(hits[0].kind, Kind::AppImage);
+    assert!(hits[0].manual.as_ref().unwrap().files.contains(&file));
+}
+
+/// A hand-installed program that isn't an AppImage stays a manual install.
+#[test]
+fn plain_program_is_still_manual() {
+    let f = Fake::new("appimage-not");
+    let bin = f.exe("home/.local/opt/tool/tool");
+    f.launcher("home/.local/share/applications/tool.desktop", &format!("Name=Tool\nExec={}", bin.display()));
+
+    let inv = scan(&f.env());
+    assert_eq!(find(&inv.packages, "Tool")[0].kind, Kind::Manual);
+    assert!(inv.packages.iter().all(|p| p.kind != Kind::AppImage));
 }

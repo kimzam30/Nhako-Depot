@@ -17,7 +17,7 @@ program of about 1 MB.
 ## What it does
 
 - **Shows everything installed** as **Deb** (apt), **RPM** (dnf), **Pacman** (including AUR builds),
-  **Snap**, **Flatpak** or **Manual** (installed by hand), each with a badge that explains what it means.
+  **Snap**, **Flatpak**, **AppImage** or **Manual** (installed by hand), each with a badge that explains what it means.
 - **Gets the source right.** Each app appears once, under the package it really came from, even
   when an install script copied its launcher into place. An app installed more than one way (say
   as a Deb and a Flatpak) gets one card that shows every copy, so you can keep just one.
@@ -97,7 +97,7 @@ from your app menu by searching for **Depot**.
 - [x] A progress window for every change: password, waiting, success, partial success, failure
 - [x] About window with licence, privacy and legal notices; AppStream metadata for software centres
 - [ ] Check every screen on a real phone-sized screen and with a screen reader
-- [ ] AppImage
+- [x] AppImage (found with or without a launcher, removed to the Trash)
 - [ ] Clean up unused Flatpak runtimes on their own, not only after an uninstall
 - [ ] Developer tools: pipx, cargo, npm, Homebrew, Nix
 - [ ] `.deb` and `.rpm` downloads on GitHub Releases

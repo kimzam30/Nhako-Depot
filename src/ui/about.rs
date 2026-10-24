@@ -125,7 +125,7 @@ fn debug_info(st: &State) -> String {
     let pkgs = st.packages.borrow();
     let mut kinds: Vec<String> = Vec::new();
     use depot_core::Kind;
-    for k in [Kind::Deb, Kind::Rpm, Kind::Pacman, Kind::Snap, Kind::Flatpak, Kind::Manual] {
+    for k in [Kind::Deb, Kind::Rpm, Kind::Pacman, Kind::Snap, Kind::Flatpak, Kind::AppImage, Kind::Manual] {
         let n = pkgs.iter().filter(|p| p.kind == k).count();
         if n > 0 {
             kinds.push(format!("{}: {n}", k.badge()));

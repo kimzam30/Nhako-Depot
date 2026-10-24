@@ -172,7 +172,7 @@ fn group_name(k: Kind) -> &'static str {
         Kind::Deb | Kind::Rpm | Kind::Pacman => "System packages",
         Kind::Snap => "Snaps",
         Kind::Flatpak => "Flatpaks",
-        Kind::Manual => "Moved to the Trash",
+        Kind::AppImage | Kind::Manual => "Moved to the Trash",
     }
 }
 
@@ -192,7 +192,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
     let single = pkgs.len() == 1;
     let p = &pkgs[0];
     let mplan = p.manual.clone().unwrap_or_default();
-    let full_manual = p.kind == Kind::Manual && mplan.appdir.is_some();
+    let full_manual = p.removes_program();
     let extra = &plan.deps;
     let heading = if !single {
         format!("Uninstall {} apps?", pkgs.len())
@@ -210,7 +210,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
             Kind::Manual if p.broken => {
                 "The program it started is already gone. The launcher will be moved to the Trash.".to_string()
             }
-            Kind::Manual if full_manual => "These files will be moved to the Trash:".to_string(),
+            Kind::AppImage | Kind::Manual if full_manual => "These files will be moved to the Trash:".to_string(),
             Kind::Manual => {
                 format!(
                     "Only the launcher is moved to the Trash. The program itself ({}) is left untouched.",
@@ -230,21 +230,21 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     if single {
-        let lines: Vec<String> = if p.kind == Kind::Manual {
+        let lines: Vec<String> = if p.kind.trashes() {
             mplan.files.iter().map(|f| short(f)).collect()
         } else {
             let mut e = extra.clone();
             e.sort();
             e
         };
-        if !lines.is_empty() && (p.kind != Kind::Manual || full_manual) {
+        if !lines.is_empty() && (!p.kind.trashes() || full_manual) {
             content.append(&listing(&lines));
         }
     } else {
         let mut by_group: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for q in pkgs.iter() {
             let mut line = q.title.clone();
-            if q.kind == Kind::Manual
+            if q.kind.trashes()
                 && let Some(m) = &q.manual
             {
                 for f in &m.files {
@@ -278,7 +278,8 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
 
     // one "also delete settings" box per kind that can do it; dnf has no way to delete settings files
     let kinds: Vec<Kind> = {
-        let mut k: Vec<Kind> = pkgs.iter().map(|q| q.kind).collect();
+        // AppImages and manual installs share one "settings and data" box
+        let mut k: Vec<Kind> = pkgs.iter().map(|q| if q.kind.trashes() { Kind::Manual } else { q.kind }).collect();
         k.sort_by_key(|k| k.css());
         k.dedup();
         k
@@ -294,7 +295,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
             Kind::Manual => {
                 let data: Vec<String> = pkgs
                     .iter()
-                    .filter(|q| q.kind == Kind::Manual)
+                    .filter(|q| q.kind.trashes())
                     .flat_map(|q| q.manual.iter().flat_map(|m| m.data.iter().map(|d| short(d))))
                     .collect();
                 if data.is_empty() {
@@ -302,7 +303,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
                 }
                 format!("Also move its settings and data to the Trash ({})", data.join(", "))
             }
-            Kind::Rpm => continue,
+            Kind::Rpm | Kind::AppImage => continue,
         };
         let label = if single { label } else { label.replace("its ", "their ").replace(" of its", " of their") };
         let c = gtk::CheckButton::with_label(&label);
@@ -468,7 +469,7 @@ fn steps(pkgs: &[Package], plan: &RemovePlan, c: &Choices) -> Vec<Step> {
             out.push(Step { items: Vec::new(), how: How::Command { cmd, root: false } });
         }
     }
-    for i in pick(&|p| p.kind == Kind::Manual) {
+    for i in pick(&|p| p.kind.trashes()) {
         out.push(Step { items: vec![i], how: How::Trash { with_data: purge(Kind::Manual) } });
     }
     out
@@ -488,7 +489,7 @@ fn item_names(pkgs: &[Package]) -> Vec<String> {
 }
 
 fn run(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, choices: Choices) {
-    let only_manual = pkgs.iter().all(|p| p.kind == Kind::Manual);
+    let only_manual = pkgs.iter().all(|p| p.kind.trashes());
     let title = match (pkgs.len(), only_manual) {
         (1, true) => format!("Moving {} to the Trash", pkgs[0].title),
         (1, false) => format!("Uninstalling {}", pkgs[0].title),
@@ -581,7 +582,7 @@ fn result(pkgs: &[Package], removed: &[bool], failures: &[(Vec<usize>, Outcome)]
     let done = removed.iter().filter(|&&r| r).count();
     let freed: u64 = pkgs.iter().zip(removed).filter(|(_, r)| **r).map(|(p, _)| p.size).sum();
     let freed = if freed > 0 { format!("About {} freed.", glib::format_size(freed)) } else { String::new() };
-    let to_trash = pkgs.iter().zip(removed).any(|(p, r)| *r && p.kind == Kind::Manual);
+    let to_trash = pkgs.iter().zip(removed).any(|(p, r)| *r && p.kind.trashes());
     let restore = if to_trash { " You can restore what went to the Trash from the Trash." } else { "" };
     let cancelled = failures.iter().any(|(_, o)| matches!(o, Outcome::Cancelled));
     let summary = failures
@@ -600,7 +601,7 @@ fn result(pkgs: &[Package], removed: &[bool], failures: &[(Vec<usize>, Outcome)]
         pkgs.iter().zip(removed).filter(|(_, r)| !**r).map(|(p, _)| p.title.as_str()).collect();
     let (ending, heading, body) = if failures.is_empty() || done == n && !cancelled {
         let heading = match (n, pkgs[0].kind) {
-            (1, Kind::Manual) => format!("{} was moved to the Trash", pkgs[0].title),
+            (1, k) if k.trashes() => format!("{} was moved to the Trash", pkgs[0].title),
             (1, _) => format!("{} was uninstalled", pkgs[0].title),
             _ => format!("{n} apps were uninstalled"),
         };
@@ -650,11 +651,13 @@ mod tests {
             fs,
             pkg(Kind::Manual, "t1"),
             pkg(Kind::Manual, "t2"),
+            pkg(Kind::AppImage, "t3"),
         ];
         let plan = RemovePlan { pk_ids: vec!["vlc;1;amd64;installed".into()], ..Default::default() };
         let s = steps(&pkgs, &plan, &Choices::default());
         let items: Vec<Vec<usize>> = s.iter().map(|s| s.items.clone()).collect();
-        assert_eq!(items, vec![vec![0], vec![1, 2], vec![3], vec![4], vec![5]]);
+        assert_eq!(items, vec![vec![0], vec![1, 2], vec![3], vec![4], vec![5], vec![6]]);
+        assert!(matches!(s[5].how, How::Trash { .. }), "AppImages go to the Trash");
         assert!(matches!(&s[0].how, How::PackageKit(ids) if ids.len() == 1));
         match &s[1].how {
             How::Command { cmd, root } => {

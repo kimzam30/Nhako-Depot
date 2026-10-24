@@ -1,6 +1,6 @@
 //! Builds the full list of installed software and decides which launcher belongs to which package.
 
-use crate::backend::{dpkg, flatpak, manual, pacman, rpm, snap};
+use crate::backend::{appimage, dpkg, flatpak, manual, pacman, rpm, snap};
 use crate::exec::{self, Target};
 use crate::model::{Kind, Package, Role};
 use crate::xdg::{self, Launcher};
@@ -196,10 +196,18 @@ fn claim(l: &Launcher, env: &Env) -> Claim {
             if let (Some(p), false) = (&path, generic) {
                 files.extend(exec::path_variants(p).into_iter().map(|v| (v, true)));
             }
-            if let Some(s) = script {
-                files.extend(exec::path_variants(&s).into_iter().map(|v| (v, true)));
+            // `appimage-run Foo.AppImage`: the AppImage is the app
+            let run_appimage = generic && script.as_deref().is_some_and(appimage::is_appimage);
+            if let Some(s) = &script {
+                files.extend(exec::path_variants(s).into_iter().map(|v| (v, true)));
             }
-            program = if generic { None } else { path };
+            program = if run_appimage {
+                script
+            } else if generic {
+                None
+            } else {
+                path
+            };
         }
         None => {}
     }
@@ -338,7 +346,7 @@ pub fn scan(env: &Env) -> Inventory {
                     flat_ix.insert(p.name.clone(), i);
                 }
             }
-            Kind::Manual => {}
+            Kind::AppImage | Kind::Manual => {}
         }
         pkgs.push(p);
     }
@@ -414,6 +422,7 @@ pub fn scan(env: &Env) -> Inventory {
         .filter(|p| p.starts_with(&env.home))
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
         .collect();
+    let mut appimages = HashSet::new();
     for (l, files, web, broken) in deferred {
         if let Some((files, program)) = files {
             let by_exec = files.iter().find_map(|(p, _)| owners.get(p)).and_then(|o| native_ix.get(o));
@@ -421,11 +430,18 @@ pub fn scan(env: &Env) -> Inventory {
                 attach(&mut pkgs[i], l);
                 continue;
             }
-            pkgs.push(manual_package(l, program, env, &icon_users, &programs, false, broken));
+            match program.filter(|p| appimage::is_appimage(p)) {
+                Some(file) => {
+                    appimages.insert(std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()));
+                    pkgs.push(appimage::from_launcher(&l.entry, file, &env.home, &icon_users));
+                }
+                None => pkgs.push(manual_package(l, program, env, &icon_users, &programs, false, broken)),
+            }
         } else {
             pkgs.push(manual_package(l, None, env, &icon_users, &programs, web, broken));
         }
     }
+    pkgs.extend(appimage::loose(&env.home, &appimages));
 
     for p in &mut pkgs {
         if p.icon.is_none() {

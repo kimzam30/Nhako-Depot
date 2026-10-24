@@ -98,6 +98,13 @@ const CATS: &[Cat] = &[
         empty: "Apps installed with Flatpak, usually from Flathub, show up here.",
     },
     Cat {
+        name: "AppImages",
+        icon: "application-x-executable-symbolic",
+        advanced: false,
+        pred: |p| p.kind == Kind::AppImage,
+        empty: "Apps you downloaded as a single AppImage file show up here.",
+    },
+    Cat {
         name: "Manual installs",
         icon: "folder-download-symbolic",
         advanced: false,

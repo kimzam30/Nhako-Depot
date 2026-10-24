@@ -19,6 +19,7 @@ The list on the left is the **sidebar**. The number next to each entry tells you
 | **Deb apps**, **RPM apps** or **Pacman apps** | Apps from your system's own software sources (which one depends on your Linux) |
 | **Snap apps** | Apps from the Snap Store |
 | **Flatpak apps** | Apps from Flathub, which run in their own sandbox |
+| **AppImages** | Apps you downloaded as a single `.AppImage` file, whether or not they're in your app menu |
 | **Manual installs** | Apps you downloaded and installed by hand |
 | **Broken launchers** | Menu entries whose app is already gone (see step 6) |
 | **Advanced** | Click to show libraries, command-line tools and runtimes. You rarely need these. |
@@ -41,6 +42,7 @@ Each card has a badge saying how the app was installed. Hover over a badge for a
   normal updates don't include it.
 - **Snap**: installed from the Snap Store. Snaps update themselves.
 - **Flatpak**: installed with Flatpak, usually from Flathub.
+- **AppImage**: an app packed into one downloaded file. Removing it moves the file to the Trash.
 - **Manual**: installed by hand, for example from a downloaded archive or script.
 - **Broken**: the launcher is still in your menu, but its app is gone.
 

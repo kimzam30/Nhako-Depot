@@ -1,5 +1,6 @@
 //! One module per way software can be installed.
 
+pub mod appimage;
 pub mod dpkg;
 pub mod flatpak;
 pub mod manual;

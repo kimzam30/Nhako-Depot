@@ -110,49 +110,76 @@ pub fn plan(
     let mut data = Vec::new();
     if let Some(dir) = &appdir {
         files.push(dir.clone());
-        let base = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
-        let autostart = home.join(".config/autostart").join(&entry.id);
-        if let Some(a) = DesktopEntry::load(&autostart, entry.id.clone())
-            && let Some(exec::Target::Program { path: Some(p), .. }) = exec::target(&a.argv(), &[])
-            && p.starts_with(dir)
-        {
-            files.push(autostart);
-        }
-        for name in [format!("{base}.metainfo.xml"), format!("{base}.appdata.xml")] {
-            let m = home.join(".local/share/metainfo").join(name);
-            if m.exists() {
-                files.push(m);
-            }
-        }
-        let dir_s = dir.to_string_lossy();
-        if let Ok(rd) = std::fs::read_dir(home.join(".local/bin")) {
-            for b in rd.flatten().map(|e| e.path()) {
-                let hit = std::fs::canonicalize(&b).is_ok_and(|r| r.starts_with(dir))
-                    || (std::fs::symlink_metadata(&b).is_ok_and(|m| m.is_file() && m.len() < 8192)
-                        && std::fs::read(&b).is_ok_and(|t| mentions(&String::from_utf8_lossy(&t), &dir_s)));
-                if hit {
-                    files.push(b);
-                }
-            }
-        }
-        let icon = entry.icon.as_str();
-        if !icon.is_empty() && !icon.contains('/') && icon_users.get(icon).copied().unwrap_or(0) <= 1 {
-            find_icons(&home.join(".local/share/icons"), icon, 0, &mut files);
-        }
+        files.extend(belongings(entry, dir, home, icon_users));
         // settings folders are only guessed when the launcher's name is the app's own name
+        let base = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
         let lower = base.to_lowercase();
         let named = |p: Option<&std::ffi::OsStr>| p.and_then(|n| n.to_str()).is_some_and(|n| n.to_lowercase() == lower);
-        let own_name = named(dir.file_name()) || named(program.and_then(Path::file_stem));
-        if base.len() >= 3 && own_name && !SHARED_DATA.iter().any(|s| s.eq_ignore_ascii_case(base)) {
-            for d in [".local/share", ".config", ".cache"] {
-                let p = home.join(d).join(base);
-                if p.exists() {
-                    data.push(p);
-                }
-            }
+        if named(dir.file_name()) || named(program.and_then(Path::file_stem)) {
+            data = guess_data(home, base);
         }
     }
     ManualPlan { appdir, files, data }
+}
+
+/// Files outside the app's own folder or file (`target`) that came with it: an autostart entry
+/// and command-line links that start it, its software-centre metadata and its icons, unless
+/// another launcher uses the same icon. `entry` is the app's launcher.
+pub(crate) fn belongings(
+    entry: &DesktopEntry,
+    target: &Path,
+    home: &Path,
+    icon_users: &HashMap<String, usize>,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let base = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
+    let autostart = home.join(".config/autostart").join(&entry.id);
+    if let Some(a) = DesktopEntry::load(&autostart, entry.id.clone())
+        && let Some(exec::Target::Program { path, script, .. }) = exec::target(&a.argv(), &[])
+        && path.iter().chain(&script).any(|p| p.starts_with(target))
+    {
+        files.push(autostart);
+    }
+    for name in [format!("{base}.metainfo.xml"), format!("{base}.appdata.xml")] {
+        let m = home.join(".local/share/metainfo").join(name);
+        if m.exists() {
+            files.push(m);
+        }
+    }
+    files.extend(bin_links(home, target));
+    let icon = entry.icon.as_str();
+    if !icon.is_empty() && icon_users.get(icon).copied().unwrap_or(0) <= 1 {
+        if !icon.contains('/') {
+            find_icons(&home.join(".local/share/icons"), icon, 0, &mut files);
+        } else if Path::new(icon).starts_with(home.join(".local/share/icons")) && Path::new(icon).is_file() {
+            files.push(PathBuf::from(icon));
+        }
+    }
+    files
+}
+
+/// Commands in `~/.local/bin` that start `target`: links into it, or small scripts naming it.
+fn bin_links(home: &Path, target: &Path) -> Vec<PathBuf> {
+    let target_s = target.to_string_lossy();
+    let Ok(rd) = std::fs::read_dir(home.join(".local/bin")) else { return Vec::new() };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|b| b != target)
+        .filter(|b| {
+            std::fs::canonicalize(b).is_ok_and(|r| r.starts_with(target))
+                || (std::fs::symlink_metadata(b).is_ok_and(|m| m.is_file() && m.len() < 8192)
+                    && std::fs::read(b).is_ok_and(|t| mentions(&String::from_utf8_lossy(&t), &target_s)))
+        })
+        .collect()
+}
+
+/// Settings and data folders named after the app (`base`), in `~/.local/share`, `~/.config` and
+/// `~/.cache`. Names too short or shared by the desktop are never guessed.
+pub(crate) fn guess_data(home: &Path, base: &str) -> Vec<PathBuf> {
+    if base.len() < 3 || SHARED_DATA.iter().any(|s| s.eq_ignore_ascii_case(base)) {
+        return Vec::new();
+    }
+    [".local/share", ".config", ".cache"].iter().map(|d| home.join(d).join(base)).filter(|p| p.exists()).collect()
 }
 
 /// Icon files named exactly `<icon>.<ext>` inside an `apps` folder.
