@@ -14,6 +14,7 @@ const HELP: &str = "Usage: depot [OPTION]
   --updates [--refresh]     Print available updates as JSON and exit
   --simulate-remove NAME    Show what removing a system package would remove (changes nothing)
   --simulate-update         Show what installing all system updates would touch (changes nothing)
+  --unused-runtimes         Print the Flatpak runtimes no app needs any more as JSON (changes nothing)
   --version                 Print the version";
 
 fn print_json(v: &impl serde::Serialize) {
@@ -29,6 +30,11 @@ fn headless(args: &[String]) -> Option<glib::ExitCode> {
     let ctx = glib::MainContext::default();
     match flag {
         "--list-only" => print_json(&depot_core::scan(&depot_core::Env::system())),
+        "--unused-runtimes" => {
+            let inv = depot_core::scan(&depot_core::Env::system());
+            let unused: Vec<&depot_core::Package> = inv.unused_runtimes.iter().map(|&i| &inv.packages[i]).collect();
+            print_json(&unused);
+        }
         "--updates" => {
             let inv = depot_core::scan(&depot_core::Env::system());
             let refresh = args.iter().any(|a| a == "--refresh");

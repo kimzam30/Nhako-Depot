@@ -196,6 +196,9 @@ fn update_bar(st: &Rc<State>) {
     if size > 0 {
         text.push_str(&format!(" · {}", glib::format_size(size)));
     }
+    if st.sel_label.text() != text && n > 0 {
+        st.win.upcast_ref::<gtk::Widget>().announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+    }
     st.sel_label.set_text(&text);
     st.sel_remove.set_sensitive(n > 0);
     st.sel_remove.set_label(&match n {

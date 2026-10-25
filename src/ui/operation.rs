@@ -357,6 +357,13 @@ impl Operation {
         self.phase.set_visible_child_name(phase);
     }
 
+    /// Tell screen readers about a change they wouldn't otherwise hear about.
+    fn announce(&self, text: &str) {
+        self.dialog
+            .upcast_ref::<gtk::Widget>()
+            .announce(text.trim_end_matches(['.', ' ']), gtk::AccessibleAnnouncementPriority::Medium);
+    }
+
     /// A small line under the progress bar; empty hides it.
     pub fn set_hint(&self, text: &str) {
         self.hint.set_text(text);
@@ -375,6 +382,7 @@ impl Operation {
     pub fn waiting_for_password(&self) {
         self.show_phase("password");
         self.status.set_text("Waiting for your password");
+        self.announce("Waiting for your password. Type it in the window that just opened.");
         self.set_hint(
             "Type your password in the window that just opened. That's your computer checking it's really you, not Depot asking.",
         );
@@ -392,6 +400,7 @@ impl Operation {
     pub fn waiting_for_lock(&self) {
         self.show_phase("lock");
         self.status.set_text("Waiting for another app to finish");
+        self.announce("Waiting for another app to finish");
         self.set_hint("Another app is installing or updating software. Depot carries on as soon as it's done.");
         self.pulsing.set(true);
     }
@@ -461,6 +470,7 @@ impl Operation {
         p.icon.remove_css_class("op-pop");
         p.icon.add_css_class("op-pop");
         p.heading.set_text(&r.heading);
+        self.announce(&format!("{}. {}", r.heading, r.body));
         p.body.set_text(&r.body);
         p.body.set_visible(!r.body.is_empty());
         p.details_text.set_text(r.details.trim());

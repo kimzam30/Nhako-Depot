@@ -1,6 +1,6 @@
 # Notices
 
-**Depot** · © 2026 Kim
+**Depot** · © 2026 kimzam30
 
 ## Licence
 
@@ -28,7 +28,7 @@ represent those projects.
 
 ## Artwork
 
-The penguin mascot and the app icon (`docs/brand/`, `data/icons/`) are © 2026 Kim. They were made
+The penguin mascot and the app icon (`docs/brand/`, `data/icons/`) are © 2026 kimzam30. They were made
 for Depot and are shared under the same licence as the program.
 
 ## Third-party software

@@ -1,6 +1,7 @@
 //! Flatpak apps and runtimes, from one `flatpak list` call.
 
 use crate::model::{Kind, Package, Role};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,13 +51,116 @@ pub fn parse(text: &str) -> Vec<Package> {
             if runtime {
                 p.role = Role::Runtime;
                 p.blocked = Some(
-                    "Runtimes are shared by Flatpak apps. Flatpak removes unused ones with: flatpak uninstall --unused"
+                    "Runtimes are shared by Flatpak apps. To remove the ones no app needs, use Clean up on the Runtimes & bases page."
                         .into(),
                 );
             } else {
                 p.user_installed = true;
             }
             Some(p)
+        })
+        .collect()
+}
+
+/// What keeps runtimes installed: the runtimes apps run on, and refs pinned with `flatpak pin`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Runtime refs (`id/arch/branch`) that an installed app runs on, in either installation.
+    pub runtimes: HashSet<String>,
+    /// Pin patterns (`runtime/id/arch/branch`, may contain `*`) and whether they're system-wide.
+    pub pins: Vec<(String, bool)>,
+}
+
+/// Read what keeps runtimes installed. Flatpak missing or failing just means nothing is known,
+/// so nothing will be offered for clean-up.
+pub fn usage() -> Option<Usage> {
+    let run = |args: &[&str]| {
+        let out = Command::new("flatpak").args(args).env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C").output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let apps = run(&["list", "--app", "--columns=runtime"])?;
+    let mut u = Usage { runtimes: parse_app_runtimes(&apps), pins: Vec::new() };
+    for system in [true, false] {
+        // an installation that doesn't exist yet has no pins, but then it has no runtimes either
+        let text = run(&["pin", if system { "--system" } else { "--user" }]).unwrap_or_default();
+        u.pins.extend(parse_pins(&text).into_iter().map(|p| (p, system)));
+    }
+    Some(u)
+}
+
+pub fn parse_app_runtimes(text: &str) -> HashSet<String> {
+    text.lines().map(str::trim).filter(|l| l.split('/').count() == 3).map(str::to_string).collect()
+}
+
+pub fn parse_pins(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|l| l.starts_with("runtime/")).map(str::to_string).collect()
+}
+
+/// `*` matches any run of characters, as in `flatpak pin` patterns.
+fn glob(pattern: &str, text: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == text,
+        Some((head, tail)) => text
+            .strip_prefix(head)
+            .is_some_and(|rest| (0..=rest.len()).any(|i| rest.is_char_boundary(i) && glob(tail, &rest[i..]))),
+    }
+}
+
+/// Runtimes that `flatpak uninstall --unused` would remove, as indices into `pkgs`: shown
+/// before cleaning up, while Flatpak itself still decides. When in doubt a runtime counts as
+/// used, so the list may be shorter than Flatpak's but never names one it would keep.
+///
+/// A runtime is unused when it isn't pinned and either
+/// - it's a base (`….Platform`, `….Sdk`, `….BaseApp`) no app runs on, or
+/// - it extends another installed ref (`org.freedesktop.Platform.GL.default` extends
+///   `org.freedesktop.Platform`) whose matching branch is installed and itself unused.
+pub fn unused(pkgs: &[Package], usage: &Usage) -> Vec<usize> {
+    let flats: Vec<usize> = (0..pkgs.len()).filter(|&i| pkgs[i].kind == Kind::Flatpak).collect();
+    let pinned = |p: &Package| {
+        let r = format!("runtime/{}", p.id);
+        usage.pins.iter().any(|(pat, system)| *system == p.system && glob(pat, &r))
+    };
+    // the longest installed id this one extends, e.g. `org.freedesktop.Platform` for `….Platform.GL.default`
+    fn parent<'a>(p: &'a Package, pkgs: &[Package], flats: &[usize]) -> Option<&'a str> {
+        flats
+            .iter()
+            .map(|&j| &pkgs[j])
+            .filter(|q| p.name.strip_prefix(q.name.as_str()).is_some_and(|r| r.starts_with('.')))
+            .map(|q| q.name.len())
+            .max()
+            .map(|n| &p.name[..n])
+    }
+    let unused_base = |p: &Package| {
+        let base = p.name.rsplit('.').next().is_some_and(|s| matches!(s, "Platform" | "Sdk" | "BaseApp"));
+        p.role == Role::Runtime
+            && base
+            && parent(p, pkgs, &flats).is_none()
+            && !usage.runtimes.contains(&p.id)
+            && !pinned(p)
+    };
+    // `25.08-extra` and `24.08extra` are built for `25.08` and `24.08`, but `6.10` isn't for `6.1`
+    let built_for = |ext: &str, branch: &str| {
+        ext.strip_prefix(branch).is_some_and(|r| r.chars().next().is_none_or(|c| !c.is_ascii_digit() && c != '.'))
+    };
+    flats
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let p = &pkgs[i];
+            if p.role != Role::Runtime || pinned(p) {
+                return false;
+            }
+            match parent(p, pkgs, &flats) {
+                Some(name) => {
+                    let mut copies = flats
+                        .iter()
+                        .map(|&j| &pkgs[j])
+                        .filter(|q| q.name == name && q.system == p.system && built_for(&p.revision, &q.revision))
+                        .peekable();
+                    copies.peek().is_some() && copies.all(unused_base)
+                }
+                None => unused_base(p),
+            }
         })
         .collect()
 }

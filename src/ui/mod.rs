@@ -133,13 +133,15 @@ const CATS: &[Cat] = &[
         empty: "Libraries and tools from your system's software sources show up here.",
     },
     Cat {
-        name: "Runtimes & bases",
+        name: RUNTIMES,
         icon: "applications-system-symbolic",
         advanced: true,
         pred: |p| p.role == Role::Runtime,
         empty: "Shared runtimes that Flatpaks and Snaps need show up here.",
     },
 ];
+
+const RUNTIMES: &str = "Runtimes & bases";
 
 /// What a sidebar row opens.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,6 +156,8 @@ struct SideRow {
     row: gtk::ListBoxRow,
     nav: Nav,
     count: gtk::Label,
+    /// The row's name, which screen readers hear together with the count.
+    name: String,
     /// Slides the row in and out.
     reveal: gtk::Revealer,
     chevron: Option<gtk::Image>,
@@ -183,6 +187,10 @@ pub struct State {
     updates: updates::View,
     /// Shown when this distro's own packages can't be read yet.
     unsupported: adw::Banner,
+    /// Offers to remove unused Flatpak runtimes, on the runtimes page.
+    runtimes_banner: adw::Banner,
+    /// Indices into `packages` of the Flatpak runtimes no app needs any more.
+    unused_runtimes: RefCell<Vec<usize>>,
     /// "browse" (the grid) or "updates".
     view: gtk::Stack,
     browse_tools: Vec<gtk::Widget>,
@@ -309,7 +317,10 @@ pub fn activate(app: &adw::Application) {
             chevron = Some(img);
         }
         catlist.append(&row);
-        let r = SideRow { row, nav, count, reveal, chevron };
+        // the count is read as part of the row's name ("Flatpak, 12"), not as a separate number
+        count.set_accessible_role(gtk::AccessibleRole::Presentation);
+        row.update_property(&[gtk::accessible::Property::Label(name)]);
+        let r = SideRow { row, nav, count, name: name.to_string(), reveal, chevron };
         hide_when_collapsed(&r);
         rows.push(r);
     };
@@ -336,6 +347,7 @@ pub fn activate(app: &adw::Application) {
         .active(true)
         .tooltip_text("Show categories")
         .build();
+    toggle.update_property(&[gtk::accessible::Property::Label("Show categories")]);
     toggle.bind_property("active", &split, "show-sidebar").bidirectional().build();
     hb.pack_start(&toggle);
     let search = gtk::SearchEntry::builder().placeholder_text("Search installed software").hexpand(true).build();
@@ -346,8 +358,10 @@ pub fn activate(app: &adw::Application) {
         .menu_model(&about::menu())
         .primary(true)
         .build();
+    menu.update_property(&[gtk::accessible::Property::Label("Main menu")]);
     hb.pack_end(&menu);
     let refresh = gtk::Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Refresh (F5)").build();
+    refresh.update_property(&[gtk::accessible::Property::Label("Refresh")]);
     hb.pack_end(&refresh);
     let upd = updates::View::new();
     hb.pack_end(&upd.update_all);
@@ -359,12 +373,15 @@ pub fn activate(app: &adw::Application) {
     hb.pack_end(&select_all);
     let sort_dd = gtk::DropDown::from_strings(&["Name", "Size (largest first)"]);
     sort_dd.set_tooltip_text(Some("Sort by"));
+    sort_dd.update_property(&[gtk::accessible::Property::Label("Sort by")]);
     hb.pack_end(&sort_dd);
     tv.add_top_bar(&hb);
     let unsupported = adw::Banner::new(
         "Depot can't read this system's own packages yet, so apps that came with it may show up as manual installs.",
     );
     tv.add_top_bar(&unsupported);
+    let runtimes_banner = adw::Banner::builder().button_label("Clean up").build();
+    tv.add_top_bar(&runtimes_banner);
 
     // the selection bar, slid in from the bottom in selection mode
     let bar = gtk::ActionBar::new();
@@ -393,7 +410,9 @@ pub fn activate(app: &adw::Application) {
             let li = li.downcast_ref::<gtk::ListItem>().expect("ListItem");
             if let (Some(obj), Some(card)) = (li.item(), li.child().and_downcast::<gtk::Overlay>()) {
                 let it = item(&obj);
-                widgets::bind_card(&card, it.p(), &it.others().collect::<Vec<_>>());
+                let others = it.others().collect::<Vec<_>>();
+                widgets::bind_card(&card, it.p(), &others);
+                li.set_accessible_label(&widgets::card_label(it.p(), &others));
                 selection.bound(&card, select::key(it.p()));
             }
         });
@@ -483,6 +502,8 @@ pub fn activate(app: &adw::Application) {
         packages: RefCell::new(Rc::new(Vec::new())),
         updates: upd,
         unsupported,
+        runtimes_banner: runtimes_banner.clone(),
+        unused_runtimes: RefCell::new(Vec::new()),
         view,
         browse_tools: vec![search.clone().upcast(), sort_dd.clone().upcast(), select.clone().upcast()],
         content: tv,
@@ -550,6 +571,7 @@ pub fn activate(app: &adw::Application) {
                 Nav::Updates if st.updates.is_stale() => updates::check(&st, true),
                 _ => {}
             }
+            update_runtimes_banner(&st);
             if split.is_collapsed() {
                 split.set_show_sidebar(false);
             }
@@ -560,6 +582,14 @@ pub fn activate(app: &adw::Application) {
     {
         let st = st.clone();
         refresh.connect_clicked(move |_| refresh_view(&st));
+    }
+    {
+        let st = st.clone();
+        runtimes_banner.connect_button_clicked(move |_| {
+            let all = st.packages.borrow().clone();
+            let picked = st.unused_runtimes.borrow().iter().map(|&i| all[i].clone()).collect();
+            remove::clean_up_runtimes(&st, picked);
+        });
     }
     {
         let st = st.clone();
@@ -717,6 +747,23 @@ fn update_stack(st: &State) {
     }
 }
 
+/// On the runtimes page, offer to remove the Flatpak runtimes no app needs any more.
+fn update_runtimes_banner(st: &State) {
+    let unused = st.unused_runtimes.borrow();
+    let on_page = !st.on_updates() && CATS[st.cat.get()].name == RUNTIMES;
+    if on_page && !unused.is_empty() {
+        let all = st.packages.borrow();
+        let size: u64 = unused.iter().map(|&i| all[i].size).sum();
+        let what = if unused.len() == 1 {
+            "1 shared runtime isn't used by any app".to_string()
+        } else {
+            format!("{} shared runtimes aren't used by any app", unused.len())
+        };
+        st.runtimes_banner.set_title(&format!("{what} ({})", glib::format_size(size)));
+    }
+    st.runtimes_banner.set_revealed(on_page && !unused.is_empty());
+}
+
 /// Show or hide sidebar rows: advanced ones follow the toggle, empty ones hide (except "All apps").
 /// Rows slide in and out rather than jumping.
 fn update_rows(st: &State) {
@@ -799,12 +846,19 @@ fn update_counts(st: &State) {
         if r.nav == Nav::Updates {
             let text = if n == 0 { String::new() } else { n.to_string() };
             if r.count.text() != text {
-                r.count.set_text(&text);
+                set_count(r, &text);
                 bump(&r.count);
             }
         }
     }
     st.updates.sync_ticks(st.on_updates());
+}
+
+/// Show a row's count, and tell screen readers along with the row's name.
+fn set_count(r: &SideRow, text: &str) {
+    r.count.set_text(text);
+    let label = if text.is_empty() { r.name.clone() } else { format!("{}, {text}", r.name) };
+    r.row.update_property(&[gtk::accessible::Property::Label(&label)]);
 }
 
 /// Replay the "count changed" animation on a label.
@@ -824,6 +878,8 @@ fn loaded(st: &Rc<State>, inv: Inventory) {
     st.unsupported.set_revealed(!inv.system_packages);
     let all = Rc::new(inv.packages);
     *st.packages.borrow_mut() = all.clone();
+    *st.unused_runtimes.borrow_mut() = inv.unused_runtimes;
+    update_runtimes_banner(st);
     // an app installed several ways gets one card, under its best copy
     let mut also: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut hidden: HashSet<usize> = HashSet::new();
@@ -855,7 +911,7 @@ fn loaded(st: &Rc<State>, inv: Inventory) {
     st.store.splice(0, st.store.n_items(), &items);
     for r in &st.rows {
         if let Nav::Cat(i) = r.nav {
-            r.count.set_text(&counts[i].to_string());
+            set_count(r, &counts[i].to_string());
         }
     }
     st.loading.set(false);

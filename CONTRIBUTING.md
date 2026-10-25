@@ -55,6 +55,17 @@ says when the password was accepted) and `operation::pk_reporter()` for PackageK
 `Operation::finish()` and a result that says, in one plain sentence, what happened. Map new error
 messages to plain language in `system::plain()`.
 
+## Accessibility
+
+- Give every icon-only button a spoken name with
+  `update_property(&[gtk::accessible::Property::Label(...)])`, as well as a tooltip.
+- Grid cards are read through the list item's label (`widgets::card_label`), so keep it in step
+  with what the card shows.
+- Anything that changes on its own, such as a progress step or a result, should go through
+  `announce()`, the way `Operation` and the selection bar do.
+- Still to check by hand: every screen at 360 px wide, and every screen with Orca
+  (Super+Alt+S), including the uninstall, updates, progress and clean-up dialogs.
+
 ## Releases, metadata and legal notices
 
 - Add the release to `<releases>` in `data/dev.kimzam.Depot.metainfo.xml` and bump `version` in
@@ -71,7 +82,8 @@ gtk4-broadwayd :5 &
 GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 cargo run   # then open http://localhost:8085
 ```
 
-Only one Depot runs at a time, so close the normal one first. If everything looks squeezed, give
+Only one Depot runs at a time, so close the normal one first, or give the test copy its own session
+bus with `dbus-run-session -- cargo run`. If everything looks squeezed, give
 Broadway a DPI: start it with `XDG_CONFIG_HOME` pointing at a folder whose `gtk-4.0/settings.ini`
 says `gtk-xft-dpi=98304`. Broadway's mouse input is unreliable with automation tools, so treat it
 as a way to look at screens, not to script clicks.

@@ -124,6 +124,8 @@ pub fn card() -> gtk::Overlay {
         .can_focus(false)
         .build();
     tick.add_css_class("card-tick");
+    // the card itself is what's announced, with "selected" from the grid
+    tick.set_accessible_role(gtk::AccessibleRole::Presentation);
     o.add_overlay(&tick);
     o
 }
@@ -133,6 +135,28 @@ pub fn card_parts(card: &gtk::Overlay) -> (gtk::Box, gtk::CheckButton) {
     let b = card.child().and_downcast::<gtk::Box>().expect("card box");
     let tick = b.next_sibling().and_downcast::<gtk::CheckButton>().expect("tick");
     (b, tick)
+}
+
+/// What a screen reader says for a card: "GIMP, Flatpak and Deb, 1.2 GB".
+pub fn card_label(p: &Package, others: &[&Package]) -> String {
+    let mut kinds = vec![p.kind.badge()];
+    for o in others {
+        if !kinds.contains(&o.kind.badge()) {
+            kinds.push(o.kind.badge());
+        }
+    }
+    let mut parts = vec![p.title.clone(), kinds.join(" and ")];
+    let size = size_text(p.size);
+    if !size.is_empty() && others.is_empty() {
+        parts.push(size);
+    }
+    if p.broken {
+        parts.push("broken launcher".into());
+    }
+    if p.foreign {
+        parts.push("from the AUR".into());
+    }
+    parts.join(", ")
 }
 
 /// Fill a card for `p`; `others` are other copies of the same app, shown as extra source badges.

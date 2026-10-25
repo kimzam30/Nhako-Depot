@@ -459,3 +459,55 @@ fn plain_program_is_still_manual() {
     assert_eq!(find(&inv.packages, "Tool")[0].kind, Kind::Manual);
     assert!(inv.packages.iter().all(|p| p.kind != Kind::AppImage));
 }
+
+#[test]
+fn unused_flatpak_runtimes() {
+    use depot_core::backend::flatpak::{Usage, parse, parse_app_runtimes, parse_pins, unused};
+    let row = |r: &str, inst: &str| format!("{r}\t\t\t\tflathub\t{inst}\t1.0 MB\t{inst},runtime\n");
+    let mut t = String::from("org.gimp.GIMP/x86_64/stable\tGIMP\t3.0\t\tflathub\tsystem\t1.0 GB\tsystem,current\n");
+    for (r, inst) in [
+        ("org.gnome.Platform/x86_64/50", "system"),          // GIMP runs on it
+        ("org.gnome.Platform/x86_64/48", "system"),          // nothing does
+        ("org.gnome.Platform/x86_64/48", "user"),            // pinned
+        ("org.freedesktop.Platform/x86_64/24.08", "system"), // nothing does
+        ("org.freedesktop.Platform/x86_64/25.08", "system"), // used from the user installation
+        ("org.freedesktop.Platform.GL.default/x86_64/24.08extra", "system"), // for the unused 24.08
+        ("org.freedesktop.Platform.GL.default/x86_64/25.08-extra", "system"), // for the used 25.08
+        ("org.freedesktop.Platform.openh264/x86_64/2.5.1", "system"), // no matching branch: keep
+        ("org.freedesktop.Sdk/x86_64/25.08", "system"),      // nothing builds with it
+        ("org.freedesktop.Sdk.Extension.rust-stable/x86_64/25.08", "system"), // extends that Sdk
+        ("org.gtk.Gtk3theme.Adwaita-dark/x86_64/3.22", "system"), // not a base: keep
+        ("org.gimp.GIMP.Locale/x86_64/stable", "system"),    // extends an app
+    ] {
+        t.push_str(&row(r, inst));
+    }
+    let pkgs = parse(&t);
+    let usage = Usage {
+        runtimes: parse_app_runtimes("org.gnome.Platform/x86_64/50\norg.freedesktop.Platform/x86_64/25.08\n\n"),
+        pins: parse_pins("  runtime/org.gnome.Platform/*/48\n").into_iter().map(|p| (p, false)).collect(),
+    };
+    let mut got: Vec<String> =
+        unused(&pkgs, &usage).into_iter().map(|i| format!("{} {}", pkgs[i].id, pkgs[i].system)).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "org.freedesktop.Platform.GL.default/x86_64/24.08extra true",
+            "org.freedesktop.Platform/x86_64/24.08 true",
+            "org.freedesktop.Sdk.Extension.rust-stable/x86_64/25.08 true",
+            "org.freedesktop.Sdk/x86_64/25.08 true",
+            "org.gnome.Platform/x86_64/48 true",
+        ]
+    );
+}
+
+#[test]
+fn unused_runtimes_ignore_a_shorter_branch() {
+    use depot_core::backend::flatpak::{Usage, parse, unused};
+    // a 6.10 extension isn't built for the unused 6.1 platform
+    let t = "org.kde.Platform/x86_64/6.1\t\t\t\tflathub\tsystem\t1 MB\tsystem,runtime\n\
+             org.kde.Platform.Ext/x86_64/6.10\t\t\t\tflathub\tsystem\t1 MB\tsystem,runtime\n";
+    let pkgs = parse(t);
+    let got: Vec<&str> = unused(&pkgs, &Usage::default()).into_iter().map(|i| pkgs[i].id.as_str()).collect();
+    assert_eq!(got, ["org.kde.Platform/x86_64/6.1"]);
+}

@@ -151,6 +151,8 @@ pub struct Inventory {
     pub system_packages: bool,
     /// Apps installed more than one way, as indices into `packages`, best copy first.
     pub duplicates: Vec<Vec<usize>>,
+    /// Flatpak runtimes no app needs any more, as indices into `packages` (see [`flatpak::unused`]).
+    pub unused_runtimes: Vec<usize>,
 }
 
 /// How a launcher was matched to its package.
@@ -296,15 +298,16 @@ fn manual_package(
 /// Read everything installed. Sources are read in parallel; one failing source only adds a warning.
 pub fn scan(env: &Env) -> Inventory {
     let native = Native::detect(env);
-    let (natives, snaps, flats, launchers) = std::thread::scope(|s| {
+    let (natives, snaps, flats, flat_usage, launchers) = std::thread::scope(|s| {
         let d = s.spawn(|| native.map_or(Ok(Vec::new()), |n| n.load(env)));
         let sn = s.spawn(|| env.snap_socket.as_deref().map_or(Ok(Vec::new()), snap::load));
         let f = s.spawn(|| if env.flatpak { flatpak::load() } else { Ok(Vec::new()) });
+        let fu = s.spawn(|| if env.flatpak { flatpak::usage() } else { None });
         let l = xdg::collect(&env.app_dirs);
         let join = |h: std::thread::ScopedJoinHandle<'_, Result<Vec<Package>, String>>| {
             h.join().unwrap_or_else(|_| Err("A loader crashed.".into()))
         };
-        (join(d), join(sn), join(f), l)
+        (join(d), join(sn), join(f), fu.join().ok().flatten(), l)
     });
 
     let mut inv = Inventory { system_packages: native.is_some(), ..Default::default() };
@@ -468,6 +471,7 @@ pub fn scan(env: &Env) -> Inventory {
     }
     pkgs.sort_by_cached_key(|p| p.title.to_lowercase());
     inv.duplicates = crate::group::duplicates(&pkgs);
+    inv.unused_runtimes = flat_usage.map(|u| flatpak::unused(&pkgs, &u)).unwrap_or_default();
     inv.packages = pkgs;
     inv
 }

@@ -413,6 +413,12 @@ fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+/// Removes the Flatpak runtimes no app needs from one installation. Flatpak itself decides
+/// which those are, and asks for the password for the system-wide installation.
+fn unused_runtimes_cmd(system: bool) -> Vec<String> {
+    args(&["flatpak", "uninstall", "--unused", "-y", "--noninteractive", if system { "--system" } else { "--user" }])
+}
+
 /// The steps that remove `pkgs` as planned and chosen.
 fn steps(pkgs: &[Package], plan: &RemovePlan, c: &Choices) -> Vec<Step> {
     let mut out = Vec::new();
@@ -465,8 +471,7 @@ fn steps(pkgs: &[Package], plan: &RemovePlan, c: &Choices) -> Vec<Step> {
         // Flatpak asks for the password itself for apps installed for everyone
         out.push(Step { items: flats.clone(), how: How::Command { cmd, root: false } });
         if c.unused_runtimes {
-            let cmd = args(&["flatpak", "uninstall", "--unused", "-y", "--noninteractive", scope]);
-            out.push(Step { items: Vec::new(), how: How::Command { cmd, root: false } });
+            out.push(Step { items: Vec::new(), how: How::Command { cmd: unused_runtimes_cmd(system), root: false } });
         }
     }
     for i in pick(&|p| p.kind.trashes()) {
@@ -572,6 +577,103 @@ fn run(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, choices: Choice
         if retry {
             op.close();
             start(&st, left, None);
+        }
+    });
+}
+
+/// Ask before removing the Flatpak runtimes no app needs any more, then remove them.
+pub fn clean_up_runtimes(st: &Rc<State>, runtimes: Vec<Package>) {
+    if runtimes.is_empty() {
+        return;
+    }
+    let size: u64 = runtimes.iter().map(|p| p.size).sum();
+    let heading = if runtimes.len() == 1 {
+        "Remove 1 unused runtime?".to_string()
+    } else {
+        format!("Remove {} unused runtimes?", runtimes.len())
+    };
+    let d = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(format!(
+            "No installed app needs these any more. This frees about {}. An app that needs one again \
+             downloads it when it's installed.",
+            glib::format_size(size)
+        ))
+        .build();
+    let lines: Vec<String> = runtimes.iter().map(runtime_line).collect();
+    d.set_extra_child(Some(&listing(&lines)));
+    d.add_response("cancel", "Cancel");
+    d.add_response("remove", "Remove");
+    d.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("cancel"));
+    d.set_close_response("cancel");
+    d.present(Some(&st.win));
+    let st = st.clone();
+    d.connect_response(Some("remove"), move |_, _| run_clean_up(&st, Rc::new(runtimes.clone())));
+}
+
+/// "GNOME Platform 48, for everyone (1.1 GB)": which copy, for whom, and how big.
+fn runtime_line(p: &Package) -> String {
+    let who = if p.system { "for everyone" } else { "only for you" };
+    let size = if p.size > 0 { format!(" ({})", glib::format_size(p.size)) } else { String::new() };
+    format!("{} {}, {who}{size}", p.name, p.revision)
+}
+
+fn run_clean_up(st: &Rc<State>, runtimes: Rc<Vec<Package>>) {
+    if runtimes.is_empty() {
+        return;
+    }
+    let names: Vec<String> = runtimes.iter().map(runtime_line).collect();
+    let op = Operation::show(&st.win, "Removing unused runtimes", &names);
+    let st = st.clone();
+    glib::spawn_future_local(async move {
+        let mut removed = vec![false; runtimes.len()];
+        let mut failures: Vec<(Vec<usize>, Outcome)> = Vec::new();
+        for system in [true, false] {
+            let items: Vec<usize> = (0..runtimes.len()).filter(|&i| runtimes[i].system == system).collect();
+            if items.is_empty() {
+                continue;
+            }
+            if failures.iter().any(|(_, o)| matches!(o, Outcome::Cancelled)) {
+                items.iter().for_each(|&i| op.item(i, ItemState::Skipped, "Not started"));
+                continue;
+            }
+            items.iter().for_each(|&i| op.item(i, ItemState::Working, ""));
+            op.set_hint(if system { "You may be asked for your password." } else { "" });
+            let o = operation::command(&op, &unused_runtimes_cmd(system), false, "Removing unused runtimes…").await;
+            let (state, note) = match o {
+                Outcome::Done => (ItemState::Done, "Removed"),
+                Outcome::Cancelled => (ItemState::Skipped, "Cancelled"),
+                Outcome::Failed { .. } => (ItemState::Failed, "Failed"),
+            };
+            for &i in &items {
+                removed[i] = state == ItemState::Done;
+                op.item(i, state, note);
+            }
+            if !matches!(o, Outcome::Done) {
+                failures.push((items, o));
+            }
+        }
+        let mut r = result(&runtimes, &removed, &failures);
+        let done = removed.iter().filter(|&&d| d).count();
+        // `result` speaks of apps; say runtimes instead
+        r.heading = match (r.ending, runtimes.len()) {
+            (Ending::Success, 1) => "The unused runtime was removed".into(),
+            (Ending::Success, _) => "Unused runtimes were removed".into(),
+            (Ending::Partial, n) => format!("{done} of {n} runtimes were removed"),
+            (Ending::Failed, _) => "Couldn't remove the unused runtimes".into(),
+            (Ending::Cancelled, _) => r.heading,
+        };
+        let changed = done > 0;
+        let retry = op.finish(r).await == Choice::Retry;
+        if changed {
+            reload(&st);
+        }
+        if retry {
+            op.close();
+            let left: Vec<Package> =
+                runtimes.iter().zip(&removed).filter(|(_, r)| !**r).map(|(p, _)| p.clone()).collect();
+            run_clean_up(&st, Rc::new(left));
         }
     });
 }

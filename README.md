@@ -34,6 +34,10 @@ program of about 1 MB.
   when the password was accepted, when another app is busy installing, and exactly what worked
   and what didn't at the end, with a **Try again** button.
 - **Finds broken launchers**: menu entries left behind after their program was removed.
+- **Frees space from Flatpak.** Flatpak apps share big "runtimes" that stay behind when the apps
+  that needed them are gone. **Advanced → Runtimes & bases** says how many no app uses any more and
+  how much space they take, and **Clean up** removes them. Runtimes you installed on purpose
+  (pinned) are left alone.
 - **Keeps the clutter out of the way.** Libraries, command-line tools and runtimes live under
   **Advanced**, so the main view shows only your apps.
 
@@ -96,9 +100,10 @@ from your app menu by searching for **Depot**.
 - [x] Select several apps to uninstall, and tick which updates to install
 - [x] A progress window for every change: password, waiting, success, partial success, failure
 - [x] About window with licence, privacy and legal notices; AppStream metadata for software centres
-- [ ] Check every screen on a real phone-sized screen and with a screen reader
 - [x] AppImage (found with or without a launcher, removed to the Trash)
-- [ ] Clean up unused Flatpak runtimes on their own, not only after an uninstall
+- [x] Clean up unused Flatpak runtimes on their own, not only after an uninstall
+- [x] Screen-reader names for icon buttons, app cards and the sidebar; progress and results are announced
+- [ ] Check every screen on a real phone-sized screen and with the Orca screen reader
 - [ ] Developer tools: pipx, cargo, npm, Homebrew, Nix
 - [ ] `.deb` and `.rpm` downloads on GitHub Releases
 
@@ -112,6 +117,7 @@ cargo run --release        # run the app
 `depot --help` lists commands that work without opening a window, handy for bug reports:
 `--list-only` prints everything installed as JSON, `--updates` prints available updates, and
 `--simulate-remove NAME` / `--simulate-update` show what PackageKit would do without changing anything.
+`--unused-runtimes` prints the Flatpak runtimes Depot would offer to clean up.
 
 | Path | What's there |
 | --- | --- |

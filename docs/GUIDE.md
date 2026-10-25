@@ -65,6 +65,7 @@ or uninstall just that copy. You usually only need one.
 
 If the Uninstall button is greyed out, hover over it to see why. Depot won't remove things your
 computer needs to work, such as the core of the system or the runtimes that Flatpak apps share.
+(Runtimes no app uses any more can be cleared out in one go: see section 7.)
 
 ## 4. Uninstall an app
 
@@ -149,7 +150,17 @@ When an app is removed but its menu entry stays behind, you get an icon in your 
 nothing. Depot lists these under **Broken launchers**. Open one and click **Remove leftover
 launcher** to move it to the Trash.
 
-## 7. When something goes wrong
+## 7. Free up space from Flatpak runtimes
+
+Flatpak apps share building blocks called **runtimes**, and a runtime can take a gigabyte or more.
+When you uninstall the last app that needed one, the runtime stays behind. Click **Advanced**, then
+**Runtimes & bases**: if any runtimes aren't used by an app any more, a bar at the top says how many
+and how much space they take. Click **Clean up**, check the list, and click **Remove**.
+
+Runtimes you installed yourself on purpose (Flatpak calls these "pinned") are never offered. If an
+app needs a removed runtime again later, Flatpak downloads it when you install that app.
+
+## 8. When something goes wrong
 
 | What you see | What to do |
 | --- | --- |
@@ -161,7 +172,7 @@ launcher** to move it to the Trash.
 | "Couldn't check everything" on the Updates page | Check your internet connection, then click the refresh button. |
 | An app is missing or in the wrong place | Click the refresh button on the main page. If it's still wrong, please report it (below). |
 
-## 8. Menu, shortcuts and About
+## 9. Menu, shortcuts and About
 
 The menu button (three lines, top right) has **Select Apps**, **Keyboard Shortcuts** (also
 **Ctrl+?**), **Privacy**, **Report a Problem** and **About Depot**. The About window shows the
