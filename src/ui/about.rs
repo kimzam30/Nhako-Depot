@@ -92,7 +92,12 @@ pub fn install(st: &Rc<State>) {
         }
     });
     action(st, "report", |st| open(st, &format!("{REPO}/issues")));
-    action(st, "select", |st| super::select::set_mode(st, true));
+    // the selection bar belongs to the app grid, not the Updates page
+    action(st, "select", |st| {
+        if !st.on_updates() {
+            super::select::set_mode(st, true)
+        }
+    });
     action(st, "quit", |st| st.win.close());
     if let Some(app) = st.win.application() {
         app.set_accels_for_action("win.shortcuts", &["<Control>question"]);
@@ -124,8 +129,7 @@ fn debug_info(st: &State) -> String {
         .unwrap_or_else(|| "unknown".into());
     let pkgs = st.packages.borrow();
     let mut kinds: Vec<String> = Vec::new();
-    use depot_core::Kind;
-    for k in [Kind::Deb, Kind::Rpm, Kind::Pacman, Kind::Snap, Kind::Flatpak, Kind::AppImage, Kind::Manual] {
+    for k in depot_core::Kind::ALL {
         let n = pkgs.iter().filter(|p| p.kind == k).count();
         if n > 0 {
             kinds.push(format!("{}: {n}", k.badge()));

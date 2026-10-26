@@ -24,26 +24,21 @@ impl Outcome {
     }
 }
 
-// PackageKit error codes with a plain explanation (PkErrorEnum)
-const PK_NO_NETWORK: u32 = 2;
-const PK_DEP_RESOLUTION_FAILED: u32 = 13;
-const PK_CANNOT_REMOVE_SYSTEM_PACKAGE: u32 = 20;
-const PK_CANNOT_GET_LOCK: u32 = 26;
-const PK_NO_SPACE_ON_DEVICE: u32 = 46;
-const PK_CANNOT_FETCH_SOURCES: u32 = 64;
-const PK_LOCK_REQUIRED: u32 = 67;
-
 /// One sentence a newcomer can act on, from a package manager's error output (and PackageKit's
 /// error code, if there is one).
 pub fn plain(details: &str, pk_code: Option<u32>) -> String {
     let d = details.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| d.contains(w));
+    use crate::packagekit::{
+        ERROR_CANNOT_FETCH_SOURCES, ERROR_CANNOT_GET_LOCK, ERROR_CANNOT_REMOVE_SYSTEM_PACKAGE,
+        ERROR_DEP_RESOLUTION_FAILED, ERROR_LOCK_REQUIRED, ERROR_NO_NETWORK, ERROR_NO_SPACE_ON_DEVICE,
+    };
     match pk_code {
-        Some(PK_CANNOT_GET_LOCK | PK_LOCK_REQUIRED) => return BUSY.into(),
-        Some(PK_NO_NETWORK | PK_CANNOT_FETCH_SOURCES) => return OFFLINE.into(),
-        Some(PK_NO_SPACE_ON_DEVICE) => return NO_SPACE.into(),
-        Some(PK_CANNOT_REMOVE_SYSTEM_PACKAGE) => return depot_core::remove::SYSTEM_NEEDS_IT.into(),
-        Some(PK_DEP_RESOLUTION_FAILED) => {
+        Some(ERROR_CANNOT_GET_LOCK | ERROR_LOCK_REQUIRED) => return BUSY.into(),
+        Some(ERROR_NO_NETWORK | ERROR_CANNOT_FETCH_SOURCES) => return OFFLINE.into(),
+        Some(ERROR_NO_SPACE_ON_DEVICE) => return NO_SPACE.into(),
+        Some(ERROR_CANNOT_REMOVE_SYSTEM_PACKAGE) => return depot_core::remove::SYSTEM_NEEDS_IT.into(),
+        Some(ERROR_DEP_RESOLUTION_FAILED) => {
             return "The package manager couldn't find a safe way to do this without breaking other software.".into();
         }
         _ => {}
@@ -67,6 +62,12 @@ pub fn plain(details: &str, pk_code: Option<u32>) -> String {
         OFFLINE.into()
     } else if has(&["no space left", "not enough space", "insufficient disk space"]) {
         NO_SPACE.into()
+    } else if has(&["no authentication agent", "no polkit agent"]) {
+        NO_AGENT.into()
+    } else if has(&["is required by", "because it is required", "needed by"]) {
+        "Other software still needs it, so it was left installed.".into()
+    } else if has(&["eacces", "permission denied", "operation not permitted"]) {
+        "Depot isn't allowed to change these files. They may have been installed for everyone, which needs an administrator.".into()
     } else if has(&["has running apps", "is running", "close the app"]) {
         "The app is still open. Close it, then try again.".into()
     } else if has(&["not found", "no such file", "unable to locate"]) {
@@ -80,6 +81,7 @@ const BUSY: &str =
     "Another app is installing or updating software right now. Wait until it's finished, then try again.";
 const OFFLINE: &str = "Depot couldn't reach the internet. Check your connection, then try again.";
 const NO_SPACE: &str = "There isn't enough free disk space. Free up some space, then try again.";
+const NO_AGENT: &str = "Depot couldn't ask for your password because your desktop's password helper isn't running. Log out and back in, then try again.";
 
 /// What a running command reports while it runs.
 pub enum Step<'a> {
@@ -92,8 +94,9 @@ pub enum Step<'a> {
 const AUTH_MARKER: &str = "@@depot-authorized@@";
 
 /// Run a command, as root through pkexec when `root` is set, reporting progress to `on`.
-/// `cancel` stops it while it can still be stopped: always for user commands, and for root ones
-/// only before the password is entered (after that the command belongs to root).
+/// `cancel` stops it while it can still be stopped: always for user commands (with Ctrl+C, so
+/// Flatpak and Snap can stop cleanly), and for root ones only before the password is entered
+/// (after that the command belongs to root).
 pub async fn run(cmd: &[String], root: bool, cancel: &gio::Cancellable, on: impl Fn(Step<'_>)) -> Outcome {
     if cmd.is_empty() {
         return Outcome::failed("Nothing to run.");
@@ -114,20 +117,27 @@ pub async fn run(cmd: &[String], root: bool, cancel: &gio::Cancellable, on: impl
     }
     argv.extend(cmd.iter().cloned());
     let os: Vec<&std::ffi::OsStr> = argv.iter().map(|a| a.as_ref()).collect();
-    let flags = gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_MERGE;
-    let proc = match gio::Subprocess::newv(&os, flags) {
+    let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_MERGE);
+    // English output, so `plain()` can recognise the errors (the root shell sets this itself)
+    launcher.setenv("LC_ALL", "C.UTF-8", true);
+    let proc = match launcher.spawn(&os) {
         Ok(p) => p,
         Err(e) => return Outcome::failed(format!("Couldn't start {}: {}", cmd[0], e.message())),
     };
     let stop = {
         let proc = proc.clone();
-        cancel.connect_cancelled_local(move |_| proc.force_exit())
+        // a user command gets Ctrl+C, which Flatpak and Snap stop cleanly on; pkexec still waiting
+        // for the password has changed nothing yet, so it's simply ended
+        cancel.connect_cancelled_local(move |_| if root { proc.force_exit() } else { proc.send_signal(2) })
     };
     let mut output = String::new();
     let mut authorized = !root;
     if let Some(out) = proc.stdout_pipe() {
         let lines = gio::DataInputStream::new(&out);
-        while let Ok(Some(line)) = lines.read_line_utf8_future(glib::Priority::DEFAULT).await {
+        // raw bytes: one line that isn't UTF-8 must not stop the reading, or the command would
+        // block on a full pipe and never finish
+        while let Ok(Some(bytes)) = lines.read_line_future(glib::Priority::DEFAULT).await {
+            let line = String::from_utf8_lossy(&bytes);
             if !authorized && line.trim() == AUTH_MARKER {
                 authorized = true;
                 on(Step::Authorized);
@@ -148,8 +158,9 @@ pub async fn run(cmd: &[String], root: bool, cancel: &gio::Cancellable, on: impl
     match proc.has_exited().then(|| proc.exit_status()) {
         Some(0) => Outcome::Done,
         // pkexec: 126 = the prompt was dismissed, 127 = not authorised. Once the marker was
-        // printed they come from the command itself (127 = program not found).
-        Some(126 | 127) if !authorized => Outcome::Cancelled,
+        // printed they come from the command itself (127 = program not found). With no password
+        // helper running nobody was asked at all, which isn't the user's choice.
+        Some(126 | 127) if !authorized && !output.to_lowercase().contains("authentication agent") => Outcome::Cancelled,
         Some(code) => {
             let details = tail(&output, 8);
             let details =
@@ -164,6 +175,11 @@ pub async fn run(cmd: &[String], root: bool, cancel: &gio::Cancellable, on: impl
 fn tail(output: &str, n: usize) -> String {
     let lines: Vec<&str> = output.trim().lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// "1 package", "3 packages".
+pub fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// PackageKit's percentage as a fraction, `None` while it doesn't know yet.
@@ -191,9 +207,51 @@ mod tests {
     #[test]
     fn plain_language_failures() {
         assert_eq!(plain("E: Could not get lock /var/lib/dpkg/lock-frontend", None), BUSY);
-        assert_eq!(plain("whatever", Some(PK_NO_NETWORK)), OFFLINE);
+        assert_eq!(plain("whatever", Some(crate::packagekit::ERROR_NO_NETWORK)), OFFLINE);
         assert!(plain("error: snap \"x\" has running apps (x)", None).contains("Close it"));
         assert!(plain("weird", None).starts_with("Something went wrong"));
+        assert!(plain("npm error code EACCES", None).contains("administrator"));
+        assert!(
+            plain("Error: Refusing to uninstall pcre2 because it is required by git", None).contains("still needs")
+        );
+        assert_eq!(plain("Error executing command as another user: No authentication agent found.", None), NO_AGENT);
+    }
+
+    fn sh(script: &str) -> Vec<String> {
+        ["sh", "-c", script].map(String::from).to_vec()
+    }
+
+    /// A line that isn't UTF-8 followed by more output than the pipe holds used to stop the
+    /// reading, so the command blocked forever and the sheet never finished.
+    #[test]
+    fn odd_output_never_stalls_a_command() {
+        let cancel = gio::Cancellable::new();
+        let lines = std::cell::Cell::new(0);
+        let o =
+            glib::MainContext::new().block_on(run(&sh("printf 'caf\\351\\n'; seq 1 30000"), false, &cancel, |_| {
+                lines.set(lines.get() + 1)
+            }));
+        assert!(matches!(o, Outcome::Done), "{o:?}");
+        assert_eq!(lines.get(), 30001);
+    }
+
+    #[test]
+    fn cancel_stops_a_user_command() {
+        let cancel = gio::Cancellable::new();
+        let c = cancel.clone();
+        let started = std::time::Instant::now();
+        let o = glib::MainContext::new().block_on(async move {
+            let press = async move {
+                glib::timeout_future(std::time::Duration::from_millis(200)).await;
+                c.cancel();
+                std::future::pending::<Outcome>().await
+            };
+            let cmd = ["sleep".to_string(), "30".into()];
+            let work = run(&cmd, false, &cancel, |_| {});
+            futures_util::future::select(Box::pin(work), Box::pin(press)).await.factor_first().0
+        });
+        assert!(started.elapsed().as_secs() < 5, "Cancel must stop it, not wait it out");
+        assert!(matches!(o, Outcome::Cancelled), "{o:?}");
     }
 
     #[test]

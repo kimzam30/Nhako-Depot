@@ -1,25 +1,21 @@
 //! Flatpak apps and runtimes, from one `flatpak list` call.
 
+use crate::command;
 use crate::model::{Kind, Package, Role};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-pub fn load() -> Result<Vec<Package>, String> {
-    let out = match Command::new("flatpak")
-        .args(["list", "--columns=ref,name,version,description,origin,installation,size,options"])
-        .env("LC_ALL", "C.UTF-8")
-        .env("LANGUAGE", "C")
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("Couldn't run flatpak: {e}")),
-    };
-    if !out.status.success() {
-        return Err(format!("flatpak list failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    Ok(parse(&String::from_utf8_lossy(&out.stdout)))
+/// Installed apps and runtimes, and what keeps runtimes installed (`None` when that couldn't be
+/// read, so nothing is offered for clean-up).
+pub fn load() -> Result<(Vec<Package>, Option<Usage>), String> {
+    let columns = "--columns=ref,name,version,description,origin,installation,size,options,runtime";
+    let Some(text) = command::output("flatpak", &["list", columns])? else { return Ok((Vec::new(), None)) };
+    Ok((parse(&text), Some(usage(app_runtimes(&text)))))
+}
+
+/// The runtimes apps run on, from the last column of `flatpak list` (empty for runtimes).
+fn app_runtimes(text: &str) -> HashSet<String> {
+    parse_app_runtimes(&text.lines().filter_map(|l| l.split('\t').nth(8)).collect::<Vec<_>>().join("\n"))
 }
 
 pub fn parse(text: &str) -> Vec<Package> {
@@ -46,6 +42,8 @@ pub fn parse(text: &str) -> Vec<Package> {
             p.revision = branch.to_string();
             p.size = parse_size(size);
             if let Some((_, eol)) = options.split_once("eol=") {
+                // `eol-rebase=` (the app that replaces it) can follow
+                let eol = eol.split_once(",eol-rebase=").map_or(eol, |(e, _)| e);
                 p.description = format!("⚠ End of life: {eol}");
             }
             if runtime {
@@ -71,21 +69,16 @@ pub struct Usage {
     pub pins: Vec<(String, bool)>,
 }
 
-/// Read what keeps runtimes installed. Flatpak missing or failing just means nothing is known,
-/// so nothing will be offered for clean-up.
-pub fn usage() -> Option<Usage> {
-    let run = |args: &[&str]| {
-        let out = Command::new("flatpak").args(args).env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C").output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let apps = run(&["list", "--app", "--columns=runtime"])?;
-    let mut u = Usage { runtimes: parse_app_runtimes(&apps), pins: Vec::new() };
+/// What keeps runtimes installed: `runtimes` (what apps run on) and the pins of both installations.
+fn usage(runtimes: HashSet<String>) -> Usage {
+    let mut u = Usage { runtimes, pins: Vec::new() };
     for system in [true, false] {
         // an installation that doesn't exist yet has no pins, but then it has no runtimes either
-        let text = run(&["pin", if system { "--system" } else { "--user" }]).unwrap_or_default();
+        let scope = if system { "--system" } else { "--user" };
+        let text = command::output("flatpak", &["pin", scope]).ok().flatten().unwrap_or_default();
         u.pins.extend(parse_pins(&text).into_iter().map(|p| (p, system)));
     }
-    Some(u)
+    u
 }
 
 pub fn parse_app_runtimes(text: &str) -> HashSet<String> {
@@ -177,30 +170,13 @@ pub struct FlatpakUpdate {
 
 /// Refs with updates in one installation. Contacts the remotes, so it can be slow.
 pub fn updates(system: bool) -> Result<Vec<FlatpakUpdate>, String> {
-    let out = match Command::new("flatpak")
-        .args([
-            "remote-ls",
-            if system { "--system" } else { "--user" },
-            "--updates",
-            "--columns=ref,application,version",
-        ])
-        .env("LC_ALL", "C.UTF-8")
-        .env("LANGUAGE", "C")
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("Couldn't run flatpak: {e}")),
-    };
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    let scope = if system { "--system" } else { "--user" };
+    match command::output("flatpak", &["remote-ls", scope, "--updates", "--columns=ref,application,version"]) {
+        Ok(text) => Ok(parse_updates(&text.unwrap_or_default(), system)),
         // an installation with no remotes isn't a problem
-        if err.contains("No remote") || err.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        return Err(format!("Flatpak couldn't check for updates: {}", err.trim()));
+        Err(f) if f.stderr.as_deref().is_some_and(|e| e.is_empty() || e.contains("No remote")) => Ok(Vec::new()),
+        Err(f) => Err(format!("Flatpak couldn't check for updates: {}", f.stderr.unwrap_or(f.message))),
     }
-    Ok(parse_updates(&String::from_utf8_lossy(&out.stdout), system))
 }
 
 pub fn parse_updates(text: &str, system: bool) -> Vec<FlatpakUpdate> {
@@ -224,7 +200,7 @@ pub fn parse_size(s: &str) -> u64 {
     let (Some(n), Some(unit)) = (it.next(), it.next()) else { return 0 };
     let Ok(n) = n.replace(',', "").parse::<f64>() else { return 0 };
     let mult = match unit {
-        "bytes" => 1.0,
+        "byte" | "bytes" => 1.0,
         "kB" => 1e3,
         "MB" => 1e6,
         "GB" => 1e9,
@@ -269,6 +245,13 @@ mod tests {
         assert!(!p[1].system);
         assert_eq!(p[1].description, "⚠ End of life: old, update");
         assert_eq!(p[0].id, "org.gimp.GIMP/x86_64/stable");
+        let rebased =
+            parse("org.x.Old/x86_64/stable\tOld\t1\t\tflathub\tuser\t1 byte\tuser,eol=Use New,eol-rebase=org.x.New\n");
+        assert_eq!(rebased[0].description, "⚠ End of life: Use New");
+        assert_eq!(rebased[0].size, 1);
+        let with_runtime = "org.gimp.GIMP/x86_64/stable\tGIMP\t2\t\tflathub\tsystem\t1 MB\tcurrent\torg.gnome.Platform/x86_64/46\n\
+                            org.gnome.Platform/x86_64/46\tGNOME\t\t\tflathub\tsystem\t1 MB\truntime\t\n";
+        assert_eq!(app_runtimes(with_runtime), ["org.gnome.Platform/x86_64/46".to_string()].into());
     }
 
     #[test]

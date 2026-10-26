@@ -5,7 +5,7 @@
 use crate::backend::{self, dpkg};
 use crate::model::Kind;
 use crate::updates::{info, pk_split};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// What removing one or more native packages involves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -131,15 +131,28 @@ pub fn pacman_command(ids: &[String], purge: bool, deps: &[String], orphans: &[S
     c
 }
 
+/// How long apt waits for another installer (Software, automatic updates) to finish, in seconds,
+/// instead of failing straight away.
+const APT_LOCK_WAIT: &str = "DPkg::Lock::Timeout=120";
+
 /// The apt command that removes the `ids` and exactly the listed orphans (dependents go with them anyway).
 pub fn apt_command(ids: &[String], purge: bool, orphans: &[String]) -> Vec<String> {
-    let mut c = vec!["apt-get".to_string(), if purge { "purge" } else { "remove" }.into(), "-y".into(), "--".into()];
+    let mut c = vec![
+        "apt-get".to_string(),
+        "-o".into(),
+        APT_LOCK_WAIT.into(),
+        if purge { "purge" } else { "remove" }.into(),
+        "-y".into(),
+        "--".into(),
+    ];
     c.extend(ids.iter().chain(orphans).cloned());
     c
 }
 
-/// Folders in a home folder that hold the user's own things, or every app's settings. Depot never
-/// trashes one of these as a whole, whatever a plan says, and never anything inside the key stores.
+/// Folders in a home folder that hold the user's own things, every app's settings, or a whole
+/// tool's installs. Depot never trashes one of these as a whole, whatever a plan says, and never
+/// anything inside the key stores. The user's own folders under their translated names come from
+/// `~/.config/user-dirs.dirs` (see [`user_dirs`]).
 const PERSONAL: &[&str] = &[
     ".config",
     ".local",
@@ -158,19 +171,45 @@ const PERSONAL: &[&str] = &[
     "Templates",
     "Videos",
     "Applications",
+    "AppImages",
     "bin",
-    ".ssh",
-    ".gnupg",
-    ".pki",
+    "snap",
     ".mozilla",
+    ".thunderbird",
+    ".steam",
+    ".local/share/Steam",
+    ".local/share/flatpak",
+    ".cargo",
+    ".cargo/bin",
+    ".rustup",
+    ".local/pipx",
+    ".local/share/pipx",
+    ".npm",
+    ".npm-global",
+    ".nix-profile",
+    ".linuxbrew",
+    ".nix-defexpr",
+    "go",
 ];
-const KEY_STORES: &[&str] = &[".ssh", ".gnupg", ".pki", ".local/share/keyrings"];
+const KEY_STORES: &[&str] = &[".ssh", ".gnupg", ".pki", ".password-store", ".local/share/keyrings"];
 
-fn lexically_safe(t: &Path, home: &Path, shared: &[impl AsRef<Path>]) -> bool {
+/// The user's own folders (Documents, Music…) as `xdg-user-dirs` names them in their language,
+/// when they're inside `home`.
+fn user_dirs(home: &Path) -> Vec<PathBuf> {
+    let text = std::fs::read_to_string(home.join(".config/user-dirs.dirs")).unwrap_or_default();
+    text.lines()
+        .filter(|l| l.starts_with("XDG_"))
+        .filter_map(|l| l.split_once('=').map(|(_, v)| v.trim().trim_matches('"')))
+        .filter_map(|v| v.strip_prefix("$HOME/"))
+        .map(|rel| home.join(rel.trim_end_matches('/')))
+        .collect()
+}
+
+fn lexically_safe(t: &Path, home: &Path, protected: &[PathBuf]) -> bool {
     t.is_absolute()
         && t.starts_with(home)
         && t != home
-        && !shared.iter().any(|r| r.as_ref() == t)
+        && !protected.iter().any(|r| r == t)
         && !t.components().any(|c| matches!(c, Component::ParentDir))
         && !PERSONAL.iter().any(|f| t == home.join(f))
         && !KEY_STORES.iter().any(|f| t.starts_with(home.join(f)))
@@ -181,7 +220,9 @@ fn lexically_safe(t: &Path, home: &Path, shared: &[impl AsRef<Path>]) -> bool {
 /// Checked both as written and with symlinks resolved, so a link can't point it somewhere else.
 pub fn safe_target(t: &Path, home: &Path, shared: &[impl AsRef<Path>]) -> bool {
     let home_ok = home.is_absolute() && home.components().count() > 1;
-    if !home_ok || !lexically_safe(t, home, shared) {
+    let mut protected: Vec<PathBuf> = shared.iter().map(|r| r.as_ref().to_path_buf()).collect();
+    protected.extend(user_dirs(home));
+    if !home_ok || !lexically_safe(t, home, &protected) {
         return false;
     }
     // the item itself may be a symlink (it's the link that gets trashed), but the folders it sits
@@ -189,19 +230,20 @@ pub fn safe_target(t: &Path, home: &Path, shared: &[impl AsRef<Path>]) -> bool {
     let (Some(parent), Some(name)) = (t.parent(), t.file_name()) else { return false };
     match (std::fs::canonicalize(parent), std::fs::canonicalize(home)) {
         (Ok(p), Ok(h)) => {
-            let shared: Vec<std::path::PathBuf> =
-                shared.iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.as_ref().to_path_buf())).collect();
-            lexically_safe(&p.join(name), &h, &shared)
+            let protected: Vec<PathBuf> =
+                protected.iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone())).collect();
+            lexically_safe(&p.join(name), &h, &protected)
         }
         // nothing there to resolve: the lexical check is all there is, and trashing it fails anyway
-        _ => true,
+        _ if std::fs::symlink_metadata(t).is_err() => true,
+        // it's there but its folders can't be resolved (no permission): too unsure to touch
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn packagekit_plan_lists_exactly_what_goes() {
@@ -238,8 +280,12 @@ mod tests {
         assert!(p.orphans.contains(&"libapp".to_string()));
         assert!(p.pk_ids.is_empty());
         // removing with no orphans ticked never asks apt to autoremove anything
-        assert_eq!(apt_command(&app, false, &[]), ["apt-get", "remove", "-y", "--", "app"]);
-        assert_eq!(apt_command(&app, true, &p.orphans[..1]), ["apt-get", "purge", "-y", "--", "app", &p.orphans[0]]);
+        let lock = ["apt-get", "-o", APT_LOCK_WAIT];
+        assert_eq!(apt_command(&app, false, &[]), [&lock[..], &["remove", "-y", "--", "app"]].concat());
+        assert_eq!(
+            apt_command(&app, true, &p.orphans[..1]),
+            [&lock[..], &["purge", "-y", "--", "app", &p.orphans[0]]].concat()
+        );
         assert!(!apt_command(&app, true, &p.orphans).iter().any(|a| a.contains("autoremove")));
         // several apps at once: none of them counts as a dependency of the others
         let both = ["app".to_string(), "app-plugin".to_string()];
@@ -300,6 +346,26 @@ mod tests {
         assert!(!safe_target(&home.join("Documents"), &home, &shared));
         assert!(!safe_target(&home.join(".ssh/id_ed25519"), &home, &shared));
         assert!(safe_target(&home.join(".config/someapp"), &home, &shared));
+    }
+
+    #[test]
+    fn trash_spares_tool_homes_and_translated_folders() {
+        let root = std::env::temp_dir().join(format!("depot-safe-dirs-{}", std::process::id()));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::write(
+            home.join(".config/user-dirs.dirs"),
+            "# written by xdg-user-dirs-update\nXDG_DOCUMENTS_DIR=\"$HOME/Dokumente\"\nXDG_MUSIC_DIR=\"/elsewhere/Musik\"\n",
+        )
+        .unwrap();
+        let shared: [PathBuf; 0] = [];
+        for d in ["Dokumente", "AppImages", "snap", ".cargo", ".cargo/bin", ".nix-profile", ".steam", ".thunderbird"] {
+            assert!(!safe_target(&home.join(d), &home, &shared), "{d} must never be trashed");
+        }
+        assert!(!safe_target(&home.join(".password-store/bank.gpg"), &home, &shared));
+        assert!(safe_target(&home.join("Dokumente/old-app"), &home, &shared), "only the folder itself is kept");
+        assert!(safe_target(&home.join("Musik"), &home, &shared), "a user folder outside home protects nothing here");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -93,6 +93,8 @@ impl Fake {
             flatpak: false,
             flatpak_share: vec![],
             cache_dir: Some(self.p("home/.cache/depot")),
+            cargo_home: Some(self.p("home/.cargo")),
+            dev_tools: false,
             os_like: vec![],
         }
     }
@@ -510,4 +512,183 @@ fn unused_runtimes_ignore_a_shorter_branch() {
     let pkgs = parse(t);
     let got: Vec<&str> = unused(&pkgs, &Usage::default()).into_iter().map(|i| pkgs[i].id.as_str()).collect();
     assert_eq!(got, ["org.kde.Platform/x86_64/6.1"]);
+}
+
+/// A folder holding one launched app next to another app nobody made a launcher for is a group,
+/// so removing the first never takes the second with it.
+#[test]
+fn group_folder_with_an_unlaunched_app() {
+    let f = Fake::new("group-unlaunched");
+    let a = f.exe("home/.local/opt/tools/a/a");
+    f.exe("home/.local/opt/tools/b/b");
+    f.launcher("home/.local/share/applications/a.desktop", &format!("Name=A\nExec={}", a.display()));
+
+    let inv = scan(&f.env());
+    let plan = find(&inv.packages, "A")[0].manual.as_ref().unwrap();
+    assert_eq!(plan.appdir, Some(f.p("home/.local/opt/tools/a")));
+    assert!(!plan.files.contains(&f.p("home/.local/opt/tools")), "{:#?}", plan.files);
+}
+
+/// A group folder with a file of its own (a README) is still a group when other apps live in it.
+#[test]
+fn group_folder_with_its_own_files() {
+    let f = Fake::new("group-readme");
+    f.write("home/opt/suite/README", "two apps");
+    let x = f.exe("home/opt/suite/x/x");
+    let y = f.exe("home/opt/suite/y/y");
+    f.launcher("home/.local/share/applications/x.desktop", &format!("Name=X\nExec={}", x.display()));
+    f.launcher("home/.local/share/applications/y.desktop", &format!("Name=Y\nExec={}", y.display()));
+
+    let inv = scan(&f.env());
+    let dir = |title: &str| find(&inv.packages, title)[0].manual.as_ref().unwrap().appdir.clone();
+    assert_eq!(dir("X"), Some(f.p("home/opt/suite/x")));
+    assert_eq!(dir("Y"), Some(f.p("home/opt/suite/y")));
+}
+
+/// One app whose folder also holds data and a README is still removed as a whole.
+#[test]
+fn app_folder_with_a_data_folder_stays_whole() {
+    let f = Fake::new("app-data");
+    f.write("home/opt/foo/README", "foo");
+    f.write("home/opt/foo/data/levels.dat", "levels");
+    f.exe("home/opt/foo/jre/bin/java");
+    let foo = f.exe("home/opt/foo/app/foo");
+    f.launcher("home/.local/share/applications/foo.desktop", &format!("Name=Foo\nExec={}", foo.display()));
+
+    let inv = scan(&f.env());
+    assert_eq!(find(&inv.packages, "Foo")[0].manual.as_ref().unwrap().appdir, Some(f.p("home/opt/foo")));
+}
+
+/// A launcher that starts an AppImage through a link removes the AppImage itself, not just the link.
+#[test]
+fn appimage_started_through_a_link() {
+    let f = Fake::new("appimage-link");
+    let file = f.appimage("home/Applications/Foo-1.2.AppImage");
+    let link = f.p("home/bin/foo");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    f.launcher("home/.local/share/applications/foo.desktop", &format!("Name=Foo\nExec={}", link.display()));
+
+    let inv = scan(&f.env());
+    let all: Vec<&Package> = inv.packages.iter().filter(|p| p.kind == Kind::AppImage).collect();
+    assert_eq!(all.len(), 1, "{all:#?}");
+    let plan = all[0].manual.as_ref().unwrap();
+    for want in [&file, &link] {
+        assert!(plan.files.contains(want), "{want:?} missing from {:#?}", plan.files);
+    }
+}
+
+/// When Flatpaks and Snaps couldn't be read, their launchers aren't offered as leftovers to delete.
+#[test]
+fn sandboxed_launchers_are_not_broken_when_their_source_was_not_read() {
+    let f = Fake::new("unread-sources");
+    f.launcher(
+        "home/.local/share/flatpak/exports/share/applications/org.x.Y.desktop",
+        "Name=Exported\nExec=flatpak run org.x.Y",
+    );
+    f.launcher(
+        "home/.local/share/applications/mine.desktop",
+        "Name=Mine\nExec=flatpak run --branch=stable org.x.Z/x86_64/stable",
+    );
+    f.launcher("home/.local/share/applications/snapped.desktop", "Name=Snapped\nExec=snap run spotify");
+    let mut env = f.env();
+    env.app_dirs.push(f.p("home/.local/share/flatpak/exports/share/applications"));
+
+    let inv = scan(&env);
+    for title in ["Exported", "Mine", "Snapped"] {
+        assert!(find(&inv.packages, title).iter().all(|p| !p.broken), "{title} looks broken");
+    }
+}
+
+/// A launcher's file argument (`--config /etc/foo.conf`) says nothing about who installed the app.
+#[test]
+fn launcher_argument_does_not_decide_ownership() {
+    let f = Fake::new("arg-owner");
+    let conf = f.write("etc/foo.conf", "x=1");
+    f.deb("foo-conf", &[&conf]);
+    let bin = f.exe("home/.local/opt/foo/foo");
+    f.launcher(
+        "home/.local/share/applications/foo.desktop",
+        &format!("Name=Foo\nExec={} --config {}", bin.display(), conf.display()),
+    );
+
+    let inv = scan(&f.env());
+    assert_eq!(find(&inv.packages, "Foo")[0].kind, Kind::Manual);
+}
+
+/// One package's file list with a name that isn't valid UTF-8 doesn't stop ownership lookup.
+#[test]
+fn pacman_ownership_survives_odd_file_names() {
+    let f = Fake::new("pacman-bytes");
+    let bin = f.exe("usr/bin/editor");
+    let own = f.launcher("usr/share/applications/editor.desktop", &format!("Name=Editor\nExec={}", bin.display()));
+    f.pacman("editor", &[&own, &bin], true);
+    f.pacman("odd", &[], true);
+    let mut odd = b"%FILES%\nusr/share/odd/caf".to_vec();
+    odd.extend([0xe9, b'\n']);
+    fs::write(f.p("var/lib/pacman/local/odd-1.0-1/files"), odd).unwrap();
+    let mut env = f.env();
+    env.dpkg_dir = f.p("nonexistent");
+
+    let inv = scan(&env);
+    assert!(inv.warnings.is_empty(), "{:?}", inv.warnings);
+    assert_eq!(find(&inv.packages, "Editor")[0].kind, Kind::Pacman);
+}
+
+/// One unreadable dpkg file list only hides that package's files; every other app keeps its owner.
+#[test]
+fn dpkg_ownership_survives_one_unreadable_list() {
+    let f = Fake::new("dpkg-unreadable");
+    let bin = f.exe("usr/bin/editor");
+    let own = f.launcher("usr/share/applications/editor.desktop", &format!("Name=Editor\nExec={}", bin.display()));
+    f.deb("editor", &[&own, &bin]);
+    f.deb("locked", &[]);
+    let locked = f.p("var/lib/dpkg/info/locked.list");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&locked).is_ok() {
+        return; // running as root: nothing is unreadable
+    }
+
+    let inv = scan(&f.env());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(find(&inv.packages, "Editor")[0].kind, Kind::Deb);
+    assert!(inv.warnings.iter().any(|w| w.contains("file lists")), "{:?}", inv.warnings);
+}
+
+/// A link to an AppImage in one of the usual folders is found, and removing it takes the file too.
+#[test]
+fn loose_appimage_behind_a_link() {
+    let f = Fake::new("appimage-loose-link");
+    let file = f.appimage("home/AppImages/Tool-2.0.AppImage");
+    let link = f.p("home/Applications/tool");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+
+    let inv = scan(&f.env());
+    let all: Vec<&Package> = inv.packages.iter().filter(|p| p.kind == Kind::AppImage).collect();
+    assert_eq!(all.len(), 1, "one AppImage, however many ways it's found: {all:#?}");
+    let files = &all[0].manual.as_ref().unwrap().files;
+    assert!(files.contains(&file), "{files:#?}");
+}
+
+#[test]
+fn cargo_programs_are_listed_and_own_their_launchers() {
+    let f = Fake::new("cargo");
+    f.write(
+        "home/.cargo/.crates2.json",
+        r#"{"installs":{
+            "zed-ish 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["zedish"]},
+            "ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["rg"]}}}"#,
+    );
+    let editor = f.exe("home/.cargo/bin/zedish");
+    f.exe("home/.cargo/bin/rg");
+    f.launcher("home/.local/share/applications/zedish.desktop", &format!("Name=Zedish\nExec={} %F", editor.display()));
+    let inv = scan(&f.env());
+    let app = find(&inv.packages, "Zedish");
+    assert_eq!(app.len(), 1, "one card, not a manual install as well: {:?}", inv.packages);
+    assert_eq!((app[0].kind, app[0].role), (Kind::Cargo, Role::App));
+    assert_eq!(app[0].name, "zed-ish");
+    let rg = find(&inv.packages, "ripgrep");
+    assert_eq!((rg[0].kind, rg[0].role, rg[0].version.as_str()), (Kind::Cargo, Role::Tool, "14.1.0"));
+    assert!(inv.warnings.is_empty(), "{:?}", inv.warnings);
 }

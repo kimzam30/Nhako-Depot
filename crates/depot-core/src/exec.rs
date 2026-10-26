@@ -89,7 +89,9 @@ pub enum Target {
         path: Option<PathBuf>,
         /// An interpreter or opener rather than the app itself.
         generic: bool,
-        /// First absolute file argument (e.g. the script an interpreter runs).
+        /// For an interpreter or opener, its first absolute file argument (the script it runs or
+        /// the file it opens). Other programs' file arguments (`--config /etc/foo.conf`) say
+        /// nothing about the app, so they're never kept.
         script: Option<PathBuf>,
     },
 }
@@ -133,7 +135,8 @@ pub fn target(argv: &[String], search: &[PathBuf]) -> Option<Target> {
     if b == "flatpak"
         && let Some(app) = after_run()
     {
-        return Some(Target::Flatpak(app.split("//").next().unwrap_or(&app).to_string()));
+        // a ref can carry its architecture and branch: `org.x.Y//stable`, `org.x.Y/x86_64/stable`
+        return Some(Target::Flatpak(app.split('/').next().unwrap_or(&app).to_string()));
     }
     if b == "snap"
         && let Some(app) = after_run()
@@ -143,8 +146,9 @@ pub fn target(argv: &[String], search: &[PathBuf]) -> Option<Target> {
     if let Some(name) = prog.strip_prefix("/snap/bin/") {
         return Some(Target::Snap(name.split('.').next().unwrap_or(name).to_string()));
     }
-    let script = rest.iter().map(Path::new).find(|p| p.is_absolute() && p.is_file()).map(Path::to_path_buf);
-    Some(Target::Program { path: resolve(prog, search), generic: is_generic(b), script })
+    let generic = is_generic(b);
+    let script = rest.iter().map(Path::new).find(|p| generic && p.is_absolute() && p.is_file()).map(Path::to_path_buf);
+    Some(Target::Program { path: resolve(prog, search), generic, script })
 }
 
 /// Look a program up the way a shell would.
@@ -231,6 +235,10 @@ mod tests {
         assert_eq!(
             target(&a(&["env", "BAMF=1", "/snap/bin/code.url-handler"]), &[]),
             Some(Target::Snap("code".into()))
+        );
+        assert_eq!(
+            target(&a(&["flatpak", "run", "org.x.Y/x86_64/stable"]), &[]),
+            Some(Target::Flatpak("org.x.Y".into()))
         );
         assert_eq!(target(&a(&["snap", "run", "spotify"]), &[]), Some(Target::Snap("spotify".into())));
         assert_eq!(

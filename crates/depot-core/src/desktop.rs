@@ -28,12 +28,28 @@ pub struct DesktopEntry {
 fn locale_suffixes() -> &'static [String] {
     static L: OnceLock<Vec<String>> = OnceLock::new();
     L.get_or_init(|| {
-        let raw = ["LC_ALL", "LC_MESSAGES", "LANG"]
-            .iter()
-            .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-            .unwrap_or_default();
-        locale_order(&raw)
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let raw = ["LC_ALL", "LC_MESSAGES", "LANG"].iter().find_map(|k| var(k)).unwrap_or_default();
+        preferred(&raw, var("LANGUAGE").as_deref())
     })
+}
+
+/// Locale suffixes to try for locale `raw`, after GNU `LANGUAGE`'s priority list (`de:fr`) if it's
+/// set; as with gettext, `LANGUAGE` counts only when the locale isn't plain C.
+fn preferred(raw: &str, language: Option<&str>) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if !locale_order(raw).is_empty() {
+        for l in language.unwrap_or("").split(':') {
+            v.extend(locale_order(l));
+        }
+    }
+    for l in locale_order(raw) {
+        if !v.contains(&l) {
+            v.push(l);
+        }
+    }
+    v.dedup();
+    v
 }
 
 /// `sr_RS.UTF-8@latin` → `sr_RS@latin`, `sr_RS`, `sr@latin`, `sr`: the order the Desktop Entry
@@ -70,6 +86,11 @@ fn list(v: &str) -> Vec<String> {
 }
 
 impl DesktopEntry {
+    /// The id without `.desktop`: `org.gnome.Nautilus`.
+    pub fn base_id(&self) -> &str {
+        self.id.strip_suffix(".desktop").unwrap_or(&self.id)
+    }
+
     pub fn load(path: &Path, id: String) -> Option<Self> {
         // a launcher is a small text file; a link to a pipe or device would hang the scan
         let m = std::fs::metadata(path).ok()?;
@@ -244,6 +265,8 @@ mod tests {
         assert_eq!(locale_order("sr_RS.UTF-8@latin"), ["sr_RS@latin", "sr_RS", "sr@latin", "sr"]);
         assert_eq!(locale_order("de_DE.UTF-8"), ["de_DE", "de"]);
         assert!(locale_order("C.UTF-8").is_empty());
+        assert_eq!(preferred("de_DE.UTF-8", Some("fr:de")), ["fr", "de", "de_DE"]);
+        assert!(preferred("C", Some("fr")).is_empty(), "LANGUAGE is ignored in the C locale");
     }
 
     #[test]

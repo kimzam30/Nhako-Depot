@@ -1,11 +1,11 @@
 //! RPM packages (Fedora, openSUSE, RHEL and friends), from one `rpm -qa` call.
 //! The database itself is SQLite, so it's read through rpm rather than directly.
 
+use crate::command;
 use crate::model::{Kind, Package};
 use crate::owners;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Packages that must never be removed from Depot, on top of dnf's `protected.d` lists.
 const ALWAYS_PROTECTED: &[&str] =
@@ -97,11 +97,7 @@ fn protected_names() -> HashSet<String> {
 }
 
 fn rpm(args: &[&str]) -> Result<String, String> {
-    match Command::new("rpm").args(args).env("LC_ALL", "C.UTF-8").output() {
-        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
-        Ok(o) => Err(format!("rpm failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
-        Err(e) => Err(format!("Couldn't run rpm: {e}")),
-    }
+    command::output("rpm", args)?.ok_or_else(|| "rpm isn't installed.".to_string())
 }
 
 /// Installed packages. `db` is the rpm database folder; nothing is read if it doesn't exist.
@@ -134,7 +130,10 @@ pub fn owners(
 ) -> (HashMap<PathBuf, String>, Option<String>) {
     owners::cached(cache, &stamp(db), wanted, |misses| {
         // owners are package names, not dnf ids; multilib copies of one name own the same files
-        rpm(&["-qa", "--queryformat", "[%{FILENAMES}\\t%{NAME}\\n]"]).map(|t| parse_file_owners(&t, misses))
+        match rpm(&["-qa", "--queryformat", "[%{FILENAMES}\\t%{NAME}\\n]"]) {
+            Ok(t) => (parse_file_owners(&t, misses), None),
+            Err(e) => (HashMap::new(), Some(e)),
+        }
     })
 }
 

@@ -1,11 +1,11 @@
 //! Arch Linux packages, read straight from pacman's local database (`/var/lib/pacman/local`).
 
+use crate::command;
 use crate::model::{Kind, Package};
 use crate::owners;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Packages that must never be removed from Depot, on top of pacman.conf's `HoldPkg`.
 const ALWAYS_HELD: &[&str] = &["base", "filesystem", "glibc", "pacman", "systemd", "linux", "linux-lts", "linux-zen"];
@@ -74,11 +74,10 @@ fn foreign_names(dir: &Path) -> HashSet<String> {
     if !synced {
         return HashSet::new();
     }
-    match Command::new("pacman").arg("--dbpath").arg(dir).arg("-Qmq").env("LC_ALL", "C").output() {
-        // exit code 1 with no output just means there are none
-        Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect(),
-        Err(_) => HashSet::new(),
-    }
+    // exit code 1 with no output just means there are none
+    let args = [OsStr::new("--dbpath"), dir.as_os_str(), OsStr::new("-Qmq")];
+    let text = command::output("pacman", &args).ok().flatten().unwrap_or_default();
+    text.lines().map(str::to_string).collect()
 }
 
 /// Package folders in the local database.
@@ -111,37 +110,38 @@ fn folder_name(dir: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Find which package owns each wanted path by scanning the `files` lists in parallel.
-/// Paths in those lists have no leading slash.
-pub fn scan_owners(local: &Path, wanted: &HashSet<PathBuf>) -> Result<HashMap<PathBuf, String>, String> {
+/// Paths in a `files` list (no leading slash), as raw bytes: file names needn't be UTF-8.
+fn file_list(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut lines = bytes.split(|b| *b == b'\n');
+    lines.by_ref().find(|l| *l == b"%FILES%");
+    lines.take_while(|l| !l.is_empty())
+}
+
+/// Find which package owns each wanted path by scanning the `files` lists in parallel. A list
+/// that can't be read leaves out only that package's files.
+pub fn scan_owners(local: &Path, wanted: &HashSet<PathBuf>) -> owners::Found {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     if wanted.is_empty() {
-        return Ok(HashMap::new());
+        return (HashMap::new(), None);
     }
-    let keys: HashSet<String> =
-        wanted.iter().filter_map(|p| p.to_str()?.strip_prefix('/').map(str::to_string)).collect();
-    let dirs = entries(local).map_err(|e| format!("Couldn't read {}: {e}", local.display()))?;
-    let failed = AtomicBool::new(false);
-    let found = owners::parallel(&dirs, |e| {
-        let Some(name) = folder_name(e) else { return Vec::new() };
-        let text = match std::fs::read_to_string(e.join("files")) {
-            Ok(t) => t,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-            Err(_) => {
-                failed.store(true, Ordering::Relaxed);
-                return Vec::new();
-            }
+    let keys: HashSet<&[u8]> = wanted.iter().filter_map(|p| p.as_os_str().as_bytes().strip_prefix(b"/")).collect();
+    let dirs = match entries(local) {
+        Ok(d) => d,
+        Err(e) => return (HashMap::new(), Some(format!("Couldn't read {}: {e}", local.display()))),
+    };
+    let (found, error) = owners::parallel(&dirs, |e| {
+        let Some(name) = folder_name(e) else { return Ok(Vec::new()) };
+        let bytes = match std::fs::read(e.join("files")) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err("Some of pacman's file lists couldn't be read.".into()),
         };
-        let files = sections(&text).remove("FILES").unwrap_or_default();
-        files
-            .into_iter()
-            .filter(|f| keys.contains(*f))
-            .map(|f| (PathBuf::from(format!("/{f}")), name.clone()))
-            .collect()
+        Ok(file_list(&bytes)
+            .filter(|f| keys.contains(f))
+            .map(|f| (PathBuf::from(std::ffi::OsString::from_vec([b"/", f].concat())), name.clone()))
+            .collect())
     });
-    if failed.into_inner() {
-        return Err("Some of pacman's file lists couldn't be read.".into());
-    }
-    Ok(owners::first_owner(found))
+    (owners::first_owner(found), error)
 }
 
 /// [`scan_owners`] with an on-disk cache that stays valid until the local database changes.

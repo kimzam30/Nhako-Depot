@@ -1,10 +1,10 @@
-//! The Updates page: apps listed one by one, everything else grouped as "System updates".
+//! The Updates page: apps and developer tools listed one by one, everything else grouped as "System updates".
 //! Every update has a tick box, all ticked to start with, so several can be installed at once.
 
-use super::operation::{self, Choice, Ending, ItemState, Operation};
+use super::operation::{self, Choice, Ending, Operation, Step};
 use super::widgets::{self, label};
 use super::{State, reload};
-use crate::system::Outcome;
+use crate::system::{Outcome, plural};
 use crate::updates;
 use adw::prelude::*;
 use depot_core::{Kind, Role, Update};
@@ -17,9 +17,15 @@ use std::time::{Duration, Instant};
 /// Re-check automatically when the page is opened and the last check is older than this.
 const STALE: Duration = Duration::from_secs(10 * 60);
 
-/// Identifies one update across checks, so a refresh keeps what the user unticked.
+/// Identifies one update across checks, so a refresh keeps what the user unticked. Native ids
+/// carry the new version, which changes when a newer one comes out, so only name and
+/// architecture count for them.
 fn key(u: &Update) -> String {
-    format!("{}/{}/{}", u.kind.css(), u.id, u.system)
+    let id = match depot_core::updates::pk_split(&u.id) {
+        Some((name, _, arch, _)) if u.kind.is_native() => format!("{name};{arch}"),
+        _ => u.id.clone(),
+    };
+    format!("{}/{id}/{}", u.kind.css(), u.system)
 }
 
 pub struct View {
@@ -34,6 +40,8 @@ pub struct View {
     checks: RefCell<Vec<(String, gtk::CheckButton)>>,
     /// The tick box on "System updates" that ticks or unticks all of them.
     system_check: RefCell<Option<gtk::CheckButton>>,
+    /// The Update button on "System updates", which installs only the ticked ones.
+    system_button: RefCell<Option<gtk::Button>>,
     select_all: RefCell<Option<gtk::Button>>,
     /// "You've skipped a security fix" note.
     security_note: gtk::Revealer,
@@ -104,6 +112,7 @@ impl View {
             skipped: RefCell::new(HashSet::new()),
             checks: RefCell::new(Vec::new()),
             system_check: RefCell::new(None),
+            system_button: RefCell::new(None),
             select_all: RefCell::new(None),
             security_note,
             syncing: Cell::new(false),
@@ -164,6 +173,9 @@ impl View {
             let on = system.iter().filter(|u| !skipped.contains(&key(u))).count();
             sc.set_inconsistent(on > 0 && on < system.len());
             sc.set_active(on == system.len());
+            if let Some(b) = self.system_button.borrow().as_ref() {
+                b.set_sensitive(on > 0 && !self.installing.get());
+            }
         }
         self.syncing.set(false);
         if let Some(sa) = self.select_all.borrow().as_ref() {
@@ -200,6 +212,7 @@ fn source(u: &Update) -> &'static str {
         Kind::Snap => "Snap",
         Kind::Flatpak => "Flatpak",
         Kind::AppImage | Kind::Manual => "",
+        Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => u.kind.badge(),
     }
 }
 
@@ -238,15 +251,19 @@ fn render(st: &Rc<State>) {
     }
     v.checks.borrow_mut().clear();
     *v.system_check.borrow_mut() = None;
+    *v.system_button.borrow_mut() = None;
     *v.select_all.borrow_mut() = None;
     let add = |g: adw::PreferencesGroup| {
         v.page.add(&g);
         v.groups.borrow_mut().push(g);
     };
     let pending = v.pending.borrow();
-    // forget unticks of updates that are gone, so they start ticked if they come back
-    let keys: HashSet<String> = pending.iter().map(key).collect();
-    v.skipped.borrow_mut().retain(|k| keys.contains(k));
+    // forget unticks of updates that are gone, so they start ticked if they come back; but not
+    // when a source couldn't be reached, as its updates are only missing from this check
+    if warnings.is_empty() {
+        let keys: HashSet<String> = pending.iter().map(key).collect();
+        v.skipped.borrow_mut().retain(|k| keys.contains(k));
+    }
     v.page.set_sensitive(!v.installing.get());
 
     let select_all = gtk::Button::builder().label("Select none").valign(gtk::Align::Center).build();
@@ -262,10 +279,22 @@ fn render(st: &Rc<State>) {
         });
     }
 
-    let apps: Vec<&Update> = pending.iter().filter(|u| u.role == Role::App).collect();
-    if !apps.is_empty() {
-        let grp = adw::PreferencesGroup::builder().title("Apps").build();
-        for u in apps {
+    // apps and developer tools are listed one by one; everything else is grouped below
+    let groups = [
+        ("Apps", None, pending.iter().filter(|u| u.role == Role::App && !u.kind.is_dev_tool()).collect::<Vec<_>>()),
+        (
+            "Developer tools",
+            Some("Programs you installed with cargo, npm or Homebrew."),
+            pending.iter().filter(|u| u.kind.is_dev_tool()).collect(),
+        ),
+    ];
+    for (title, description, list) in groups {
+        if list.is_empty() {
+            continue;
+        }
+        let grp = adw::PreferencesGroup::builder().title(title).build();
+        grp.set_description(description);
+        for u in list {
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&u.title))
                 .subtitle(glib::markup_escape_text(&format!("{} · {}", versions(u), source(u))))
@@ -286,7 +315,8 @@ fn render(st: &Rc<State>) {
         add(grp);
     }
 
-    let system: Vec<Update> = pending.iter().filter(|u| u.role != Role::App).cloned().collect();
+    let system: Vec<Update> =
+        pending.iter().filter(|u| u.role != Role::App && !u.kind.is_dev_tool()).cloned().collect();
     if !system.is_empty() {
         let grp = adw::PreferencesGroup::builder()
             .title("System")
@@ -294,18 +324,25 @@ fn render(st: &Rc<State>) {
             .build();
         let security = system.iter().any(|u| u.security);
         let n = system.len();
-        let subtitle = format!(
-            "{n} package{}{}",
-            if n == 1 { "" } else { "s" },
-            if security { ", including security fixes" } else { "" }
-        );
+        let subtitle =
+            format!("{}{}", plural(n, "package", "packages"), if security { ", including security fixes" } else { "" });
         let exp = adw::ExpanderRow::builder().title("System updates").subtitle(subtitle).build();
         let all = tick(st, system.iter().map(key).collect());
         all.set_tooltip_text(Some("Include all system updates"));
         exp.add_prefix(&all);
         *v.system_check.borrow_mut() = Some(all);
         exp.add_prefix(&gtk::Image::builder().icon_name("system-software-update-symbolic").pixel_size(32).build());
-        exp.add_suffix(&update_button(st, system.clone()));
+        // installs the ticked system updates, not all of them
+        let b = gtk::Button::builder().label("Update").valign(gtk::Align::Center).build();
+        {
+            let (st, system) = (st.clone(), system.clone());
+            b.connect_clicked(move |_| {
+                let skipped = st.updates.skipped.borrow().clone();
+                run(&st, system.iter().filter(|u| !skipped.contains(&key(u))).cloned().collect());
+            });
+        }
+        exp.add_suffix(&b);
+        *v.system_button.borrow_mut() = Some(b);
         for u in &system {
             let mut sub = format!("{} · {}", versions(u), source(u));
             if u.kind == Kind::Flatpak {
@@ -462,12 +499,20 @@ async fn install(st: &Rc<State>, list: Vec<Update>) -> bool {
     let batches = updates::batches(&list);
     let titles: Vec<String> = batches.iter().map(|b| b.title.clone()).collect();
     let op = Operation::show(&st.win, &title, &titles);
-    // batches still to run, with their place in the sheet's checklist
-    let mut todo: Vec<(usize, updates::Batch)> = batches.into_iter().enumerate().collect();
+    if batches.is_empty() {
+        // never "Updates installed" when nothing was run
+        let r = result(n, &list, 0, &[Outcome::failed("Depot doesn't know how to install these updates yet.")]);
+        op.finish(operation::Result { retry: false, ..r }).await;
+        return false;
+    }
+    // batches still to run, each with its place in the sheet's checklist
+    let n_batches = batches.len();
+    let mut todo: Vec<Step<updates::Batch>> =
+        batches.into_iter().enumerate().map(|(i, b)| Step { items: vec![i], work: b }).collect();
     let mut changed = false;
     let mut done_count = 0;
     loop {
-        let native: Vec<String> = todo.iter().filter_map(|(_, b)| b.native_ids()).flatten().cloned().collect();
+        let native: Vec<String> = todo.iter().filter_map(|s| s.work.native_ids()).flatten().cloned().collect();
         if !native.is_empty() {
             op.checking("Checking what else would change…");
             match updates::removals(&native).await {
@@ -479,46 +524,29 @@ async fn install(st: &Rc<State>, list: Vec<Update>) -> bool {
                 Err(o) => {
                     let r = result(n, &list, done_count, &[o]);
                     if op.finish(r).await == Choice::Retry {
+                        op.reset();
                         continue;
                     }
                     return changed;
                 }
             }
         }
-        let mut failures = Vec::new();
-        let mut left = Vec::new();
-        let mut stopped = false;
-        for (i, b) in todo {
-            if stopped {
-                op.item(i, ItemState::Skipped, "Not started");
-                left.push((i, b));
-                continue;
-            }
-            op.item(i, ItemState::Working, "");
-            op.set_hint(if updates::may_ask(&b) { "You may be asked for your password." } else { "" });
-            let o = updates::apply(&b, &op).await;
-            match &o {
-                Outcome::Done => {
-                    op.item(i, ItemState::Done, "Updated");
-                    changed = true;
-                    done_count += 1;
-                }
-                Outcome::Cancelled => {
-                    op.item(i, ItemState::Skipped, "Cancelled");
-                    stopped = true;
-                    failures.push(o);
-                    left.push((i, b));
-                }
-                Outcome::Failed { .. } => {
-                    op.item(i, ItemState::Failed, "Failed");
-                    failures.push(o);
-                    left.push((i, b));
-                }
-            }
-        }
+        let ran = operation::run_steps(
+            &op,
+            n_batches,
+            todo,
+            |_| "Updated",
+            async |s: &Step<updates::Batch>| updates::apply(&s.work, &op).await,
+        )
+        .await;
+        let worked = ran.done.iter().filter(|&&d| d).count();
+        changed |= worked > 0;
+        done_count += worked;
+        let failures: Vec<Outcome> = ran.failures.into_iter().map(|(_, o)| o).collect();
         let r = result(n, &list, done_count, &failures);
-        if op.finish(r).await == Choice::Retry && !left.is_empty() {
-            todo = left;
+        if op.finish(r).await == Choice::Retry && !ran.left.is_empty() {
+            op.reset();
+            todo = ran.left;
             continue;
         }
         return changed;
@@ -544,7 +572,7 @@ fn result(n: usize, list: &[Update], done: usize, failures: &[Outcome]) -> opera
         (false, false, true) => (
             Ending::Cancelled,
             "Nothing was changed".into(),
-            "The password wasn't entered, so no updates were installed.".into(),
+            "No updates were installed: the password wasn't entered, or it was cancelled.".into(),
         ),
         (false, true, true) => (
             Ending::Partial,
@@ -572,7 +600,7 @@ async fn confirm_removals(st: &State, removed: &[String]) -> bool {
         .heading("This update removes software")
         .body(format!(
             "To install these updates, {} will be removed:\n\n{}",
-            if n == 1 { "1 package".to_string() } else { format!("{n} packages") },
+            plural(n, "package", "packages"),
             removed.join(", ")
         ))
         .build();

@@ -9,7 +9,7 @@ use depot_core::{Kind, Package, Role};
 use gtk::{gio, glib};
 use std::rc::Rc;
 
-pub fn remove_label(p: &Package) -> &'static str {
+fn remove_label(p: &Package) -> &'static str {
     if p.broken {
         "Remove leftover launcher"
     } else if p.kind == Kind::Manual && !p.removes_program() {
@@ -145,6 +145,16 @@ pub fn show(st: &Rc<State>, p: Package, others: Vec<Package>) {
             rows.push(("File", p.location.clone()));
         }
         Kind::Rpm => rows.push(("Group", p.section.clone())),
+        Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => {
+            let from = if p.kind == Kind::Nix { "Comes from" } else { "From" };
+            rows.extend([(from, p.channel.clone()), ("Location", p.location.clone())]);
+            if p.kind == Kind::Pipx {
+                rows.push(("Runs on", p.revision.clone()));
+            }
+            if p.kind == Kind::Brew && !p.user_installed {
+                rows.push(("Installed", "Automatically, because something else needs it".into()));
+            }
+        }
         Kind::Deb | Kind::Pacman => {
             rows.push((if p.kind == Kind::Deb { "Section" } else { "Groups" }, p.section.clone()));
             if p.foreign {
@@ -240,7 +250,11 @@ fn copies(st: &Rc<State>, p: &Rc<Package>, others: &[Package]) -> adw::Preferenc
             let b = gtk::Button::builder().label("Show").valign(gtk::Align::Center).build();
             let (st, c) = (st.clone(), c.clone());
             let rest: Vec<Package> = all.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| o.clone()).collect();
-            b.connect_clicked(move |_| show(&st, c.clone(), rest.clone()));
+            b.connect_clicked(move |_| {
+                // this copy's page takes this page's place, so going back returns to the list
+                st.nav.pop();
+                show(&st, c.clone(), rest.clone());
+            });
             row.add_suffix(&b);
             row.set_activatable_widget(Some(&b));
         }

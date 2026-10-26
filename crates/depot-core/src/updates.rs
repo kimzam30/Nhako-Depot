@@ -64,9 +64,10 @@ fn from_installed(kind: Kind, id: String, name: &str, to: String, p: Option<&Pac
 }
 
 /// Native package updates from PackageKit's `GetUpdates`, as `(info, package id)`.
-/// Held-back (`BLOCKED`) updates are skipped since they can't be installed.
+/// Held-back (`BLOCKED`) updates are skipped since they can't be installed. With no system
+/// packages read there's nothing to match them to (nor to tell deb from rpm), so there are none.
 pub fn from_packagekit(pk: &[(u32, String)], inv: &[Package]) -> Vec<Update> {
-    let kind = backend::native_kind(inv);
+    let Some(kind) = backend::native_kind(inv) else { return Vec::new() };
     let natives = index(inv, kind);
     pk.iter()
         .filter(|(i, _)| *i != info::BLOCKED)
@@ -105,6 +106,38 @@ pub fn from_flatpaks(ups: &[FlatpakUpdate], inv: &[Package]) -> Vec<Update> {
             u
         })
         .collect()
+}
+
+/// Updates a developer tool reported as `(name, newest version)`. Packages Depot can't change
+/// (npm packages installed for everyone) get none, since installing them needs an administrator.
+pub fn from_tool(kind: Kind, found: &[(String, String)], inv: &[Package]) -> Vec<Update> {
+    let installed = index(inv, kind);
+    found
+        .iter()
+        .filter_map(|(name, to)| {
+            let p = installed.get(name.as_str()).copied().filter(|p| p.blocked.is_none())?;
+            Some(from_installed(kind, name.clone(), &p.name, to.clone(), Some(p)))
+        })
+        .collect()
+}
+
+/// Whether version `a` is newer than `b`, comparing the dotted numbers (`1.10.0` is newer than
+/// `1.9.2`). A pre-release (`2.0.0-rc.1`) is older than the release itself.
+pub fn newer(a: &str, b: &str) -> bool {
+    let split = |v: &str| {
+        let (core, pre) = v.split_once(['-', '+']).map_or((v, None), |(c, p)| (c, Some(p.to_string())));
+        let nums: Vec<u64> = core.split('.').map(|n| n.trim().parse().unwrap_or(0)).collect();
+        (nums, pre)
+    };
+    let ((mut x, xp), (mut y, yp)) = (split(a), split(b));
+    let len = x.len().max(y.len());
+    x.resize(len, 0);
+    y.resize(len, 0);
+    match x.cmp(&y) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => xp.is_none() && yp.is_some(),
+    }
 }
 
 /// Drop updates for software that's no longer installed, so the list stays right after an
@@ -184,6 +217,34 @@ mod tests {
         retain_installed(&mut u, &inv);
         assert_eq!(u.len(), 1);
         assert_eq!(u[0].name, "firefox");
+    }
+
+    #[test]
+    fn no_system_packages_read_means_no_guessing() {
+        let arch = dpkg::native_arch();
+        let pk = vec![(info::NORMAL, format!("firefox;2.0;{arch};x"))];
+        assert!(from_packagekit(&pk, &[]).is_empty(), "never labelled as debs by default");
+    }
+
+    #[test]
+    fn version_order() {
+        assert!(newer("1.10.0", "1.9.2"));
+        assert!(newer("2.0.0", "2.0.0-rc.1"));
+        assert!(!newer("2.0.0-rc.1", "2.0.0"));
+        assert!(!newer("1.0", "1.0.0"));
+        assert!(!newer("0.9.9", "1.0.0"));
+    }
+
+    #[test]
+    fn tool_updates_skip_what_needs_an_administrator() {
+        let mut ts = Package::new(Kind::Npm, "typescript");
+        ts.version = "5.6.2".into();
+        let mut eslint = Package::new(Kind::Npm, "eslint");
+        eslint.blocked = Some("for everyone".into());
+        let found = vec![("typescript".to_string(), "5.7.1".to_string()), ("eslint".to_string(), "9.1".to_string())];
+        let u = from_tool(Kind::Npm, &found, &[ts, eslint]);
+        assert_eq!(u.len(), 1);
+        assert_eq!((u[0].from.as_str(), u[0].to.as_str()), ("5.6.2", "5.7.1"));
     }
 
     #[test]

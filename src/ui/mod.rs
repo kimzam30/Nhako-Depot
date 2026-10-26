@@ -126,10 +126,17 @@ const CATS: &[Cat] = &[
         empty: "Command-line tools you installed yourself show up here.",
     },
     Cat {
+        name: "Developer tools",
+        icon: "system-run-symbolic",
+        advanced: true,
+        pred: |p| p.kind.is_dev_tool(),
+        empty: "Programs installed with cargo, npm, pipx, Homebrew or Nix show up here.",
+    },
+    Cat {
         name: "All system packages",
         icon: "applications-engineering-symbolic",
         advanced: true,
-        pred: |p| p.role == Role::Tool,
+        pred: |p| p.role == Role::Tool && p.kind.is_native(),
         empty: "Libraries and tools from your system's software sources show up here.",
     },
     Cat {
@@ -208,7 +215,7 @@ impl State {
         self.toasts.add_toast(adw::Toast::new(text));
     }
 
-    fn on_updates(&self) -> bool {
+    pub(crate) fn on_updates(&self) -> bool {
         self.view.visible_child_name().as_deref() == Some("updates")
     }
 }
@@ -414,6 +421,16 @@ pub fn activate(app: &adw::Application) {
                 widgets::bind_card(&card, it.p(), &others);
                 li.set_accessible_label(&widgets::card_label(it.p(), &others));
                 selection.bound(&card, select::key(it.p()));
+            }
+        });
+    }
+    {
+        let selection = selection.clone();
+        factory.connect_teardown(move |_, li| {
+            if let Some(card) =
+                li.downcast_ref::<gtk::ListItem>().and_then(|li| li.child()).and_downcast::<gtk::Overlay>()
+            {
+                selection.forget(&card);
             }
         });
     }

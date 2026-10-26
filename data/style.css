@@ -28,6 +28,11 @@
 .badge-flatpak { background: alpha(#4a90d9, .18); color: #4a90d9; }
 .badge-appimage { background: alpha(#0d9488, .18); color: #0d9488; }
 .badge-manual { background: alpha(#2ec27e, .18); color: #2ec27e; }
+.badge-cargo { background: alpha(#c4501b, .18); color: #c4501b; }
+.badge-npm { background: alpha(#cb3837, .16); color: #cb3837; }
+.badge-pipx { background: alpha(#3776ab, .18); color: #3776ab; }
+.badge-brew { background: alpha(#b07d1a, .20); color: #b07d1a; }
+.badge-nix { background: alpha(#5277c3, .18); color: #5277c3; }
 .badge-sys { background: alpha(currentColor, .10); }
 .badge-broken { background: alpha(#e5a50a, .20); color: #c88800; }
 

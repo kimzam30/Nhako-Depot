@@ -13,12 +13,42 @@ pub enum Kind {
     Flatpak,
     AppImage,
     Manual,
+    /// `cargo install`
+    Cargo,
+    /// `npm install -g`
+    Npm,
+    Pipx,
+    /// Homebrew on Linux
+    Brew,
+    /// `nix profile install`
+    Nix,
 }
 
 impl Kind {
+    /// Every kind, in the order the About page counts them.
+    pub const ALL: [Kind; 12] = [
+        Kind::Deb,
+        Kind::Rpm,
+        Kind::Pacman,
+        Kind::Snap,
+        Kind::Flatpak,
+        Kind::AppImage,
+        Kind::Manual,
+        Kind::Cargo,
+        Kind::Npm,
+        Kind::Pipx,
+        Kind::Brew,
+        Kind::Nix,
+    ];
+
     /// The distro's own package format (Deb, RPM or Pacman), managed through PackageKit.
     pub fn is_native(self) -> bool {
         matches!(self, Kind::Deb | Kind::Rpm | Kind::Pacman)
+    }
+
+    /// Installed with a developer tool's own package manager, which also removes and updates it.
+    pub fn is_dev_tool(self) -> bool {
+        matches!(self, Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix)
     }
 
     /// Removed by moving its files to the Trash rather than through a package manager.
@@ -36,6 +66,11 @@ impl Kind {
             Kind::Flatpak => "Flatpak",
             Kind::AppImage => "AppImage",
             Kind::Manual => "Manual",
+            Kind::Cargo => "Cargo",
+            Kind::Npm => "npm",
+            Kind::Pipx => "pipx",
+            Kind::Brew => "Homebrew",
+            Kind::Nix => "Nix",
         }
     }
 
@@ -49,6 +84,11 @@ impl Kind {
             Kind::Flatpak => "flatpak",
             Kind::AppImage => "appimage",
             Kind::Manual => "manual",
+            Kind::Cargo => "cargo",
+            Kind::Npm => "npm",
+            Kind::Pipx => "pipx",
+            Kind::Brew => "brew",
+            Kind::Nix => "nix",
         }
     }
 
@@ -62,6 +102,11 @@ impl Kind {
             Kind::Flatpak => "Flatpak",
             Kind::AppImage => "AppImage (a single downloaded file)",
             Kind::Manual => "Manual install (not from a package manager)",
+            Kind::Cargo => "Rust program (cargo install)",
+            Kind::Npm => "Node.js package (npm install -g)",
+            Kind::Pipx => "Python app (pipx)",
+            Kind::Brew => "Homebrew package",
+            Kind::Nix => "Nix profile package",
         }
     }
 
@@ -77,6 +122,11 @@ impl Kind {
             Kind::Manual => {
                 "Installed by hand (downloaded archive, script or launcher), not through a package manager."
             }
+            Kind::Cargo => "Built from source and installed with Rust's cargo, usually from crates.io.",
+            Kind::Npm => "Installed for the whole computer or your account with Node.js's npm.",
+            Kind::Pipx => "A Python program installed with pipx, in a folder of its own.",
+            Kind::Brew => "Installed with Homebrew, a package manager many developers use on Linux too.",
+            Kind::Nix => "Installed into your Nix profile with the Nix package manager.",
         }
     }
 }
@@ -145,6 +195,10 @@ pub struct Package {
     /// Flatpak: the branch that starts by default when several are installed.
     pub current: bool,
     pub manual: Option<ManualPlan>,
+    /// Developer tools: the files and folders that are theirs (programs, package folders), so
+    /// launchers that start them are matched to them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathBuf>,
 }
 
 impl Package {
@@ -159,12 +213,27 @@ impl Package {
         match self.kind {
             Kind::AppImage => true,
             Kind::Manual => self.manual.as_ref().is_some_and(|m| m.appdir.is_some()),
-            _ => false,
+            Kind::Deb | Kind::Rpm | Kind::Pacman | Kind::Snap | Kind::Flatpak => false,
+            Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => false,
         }
     }
 
     /// Lowercased text matched by search.
     pub fn search_text(&self) -> String {
         format!("{} {} {}", self.title, self.name, self.summary).to_lowercase()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Kind;
+
+    #[test]
+    fn all_lists_every_kind_once() {
+        // a new kind must be added to ALL too: its badge would otherwise be missing from counts
+        for (i, k) in Kind::ALL.iter().enumerate() {
+            assert_eq!(*k as usize, i, "{k:?}");
+        }
+        assert_eq!(Kind::ALL.len(), Kind::Nix as usize + 1, "ALL ends with the last kind");
     }
 }

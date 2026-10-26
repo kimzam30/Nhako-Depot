@@ -33,6 +33,7 @@ pub fn parse_name(file_name: &str) -> (String, String) {
         Some((s, x)) if x.eq_ignore_ascii_case("appimage") => s,
         _ => file_name,
     };
+    let raw_stem = stem;
     // `x86_64` would otherwise be split in two at its underscore
     let stem = stem.replace("x86_64", "x86-64");
     let words: Vec<String> = stem
@@ -49,7 +50,7 @@ pub fn parse_name(file_name: &str) -> (String, String) {
     let split = words.iter().skip(1).position(digit).map_or(words.len(), |i| i + 1);
     let title = words[..split].join(" ");
     let version = words.get(split).map(|v| v.strip_prefix(['v', 'V']).unwrap_or(v).to_string()).unwrap_or_default();
-    if title.is_empty() { (stem.to_string(), version) } else { (title, version) }
+    if title.is_empty() { (raw_stem.to_string(), version) } else { (title, version) }
 }
 
 /// Folders people keep AppImages in, with how many folder levels to look below each.
@@ -69,7 +70,8 @@ fn find(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
             if depth > 0 {
                 find(&p, depth - 1, out);
             }
-        } else if t.is_file() && is_appimage(&p) {
+        // a link to an AppImage counts too (followed only for files, never into folders)
+        } else if (t.is_file() || (t.is_symlink() && p.is_file())) && is_appimage(&p) {
             out.push(p);
         }
     }
@@ -92,10 +94,19 @@ fn package(id: String, file: &Path, home: &Path) -> Package {
     p
 }
 
-/// An AppImage started by launcher `entry`. `icon_users` counts the launchers using each icon,
-/// so an icon another launcher needs is never removed.
-pub fn from_launcher(entry: &DesktopEntry, file: &Path, home: &Path, icon_users: &HashMap<String, usize>) -> Package {
-    let base = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
+/// An AppImage started by launcher `entry`, through `program` (the file itself or a link to it).
+/// `icon_users` counts the launchers using each icon, so an icon another launcher needs is never
+/// removed.
+pub fn from_launcher(
+    entry: &DesktopEntry,
+    program: &Path,
+    home: &Path,
+    icon_users: &HashMap<String, usize>,
+) -> Package {
+    // the real file goes, not just a link to it (which would leave it behind as a loose AppImage)
+    let real = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let file = real.as_path();
+    let base = entry.base_id();
     let mut p = package(base.to_string(), file, home);
     if !entry.name.is_empty() {
         p.title = entry.name.clone();
@@ -110,9 +121,30 @@ pub fn from_launcher(entry: &DesktopEntry, file: &Path, home: &Path, icon_users:
         );
     }
     let mut files = vec![entry.path.clone(), file.to_path_buf()];
-    files.extend(super::manual::belongings(entry, file, home, icon_users));
-    p.manual = Some(ManualPlan { appdir: None, files, data: super::manual::guess_data(home, &p.name) });
+    // the link goes too, unless it's in a system folder Depot can't touch anyway
+    if program != file && program.starts_with(home) {
+        files.push(program.to_path_buf());
+    }
+    files.extend(super::manual::belongings(entry, file, home, icon_users).into_iter().filter(|b| b != program));
+    p.manual = Some(ManualPlan { appdir: None, files, data: data_folders(home, &[&p.name, &p.title]) });
     p
+}
+
+/// Settings folders an AppImage may have made, from its names (from the file and from its
+/// launcher): apps name them `Obsidian`, `obsidian` or `balena-etcher`.
+fn data_folders(home: &Path, names: &[&str]) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    for title in names {
+        let lower = title.to_lowercase();
+        for name in [title.to_string(), lower.clone(), lower.replace(' ', "-")] {
+            for d in super::manual::guess_data(home, &name) {
+                if !v.contains(&d) {
+                    v.push(d);
+                }
+            }
+        }
+    }
+    v
 }
 
 /// AppImages in the usual folders that no launcher starts. `claimed` are the (resolved) files
@@ -130,12 +162,17 @@ pub fn loose(home: &Path, claimed: &HashSet<PathBuf>) -> Vec<Package> {
             !claimed.contains(&real) && seen.insert(real)
         })
         .map(|f| {
-            let mut p = package(f.to_string_lossy().into_owned(), &f, home);
+            // a link found in one of the folders: the file it points to goes as well
+            let real = std::fs::canonicalize(&f).unwrap_or_else(|_| f.clone());
+            let mut p = package(f.to_string_lossy().into_owned(), &real, home);
             p.summary = "Not in your app menu.".into();
-            let links = super::manual::belongings(&DesktopEntry::default(), &f, home, &HashMap::new());
-            let mut files = vec![f.clone()];
-            files.extend(links);
-            p.manual = Some(ManualPlan { appdir: None, files, data: super::manual::guess_data(home, &p.name) });
+            let links = super::manual::belongings(&DesktopEntry::default(), &real, home, &HashMap::new());
+            let mut files = vec![real.clone()];
+            if f != real {
+                files.push(f.clone());
+            }
+            files.extend(links.into_iter().filter(|l| *l != f));
+            p.manual = Some(ManualPlan { appdir: None, files, data: data_folders(home, &[&p.title]) });
             p
         })
         .collect()
@@ -157,6 +194,7 @@ mod tests {
         assert_eq!(n("Kdenlive-24.08.1-x86_64.appimage"), ("Kdenlive".into(), "24.08.1".into()));
         assert_eq!(n("balena-etcher-1.18.11-x64.AppImage"), ("balena etcher".into(), "1.18.11".into()));
         assert_eq!(n("7zip.AppImage"), ("7zip".into(), "".into()));
+        assert_eq!(n("x86_64.AppImage"), ("x86_64".into(), "".into()), "nothing but platform words");
     }
 
     #[test]

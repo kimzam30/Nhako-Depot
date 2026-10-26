@@ -15,7 +15,10 @@ fn norm(s: &str) -> String {
 fn token(p: &Package) -> String {
     let raw = match p.kind {
         Kind::Flatpak | Kind::Manual => p.name.rsplit('.').next().unwrap_or(&p.name),
-        _ => &p.name,
+        Kind::Deb | Kind::Rpm | Kind::Pacman | Kind::Snap | Kind::AppImage => &p.name,
+        // `@scope/name` on npm
+        Kind::Npm => p.name.rsplit('/').next().unwrap_or(&p.name),
+        Kind::Cargo | Kind::Pipx | Kind::Brew | Kind::Nix => &p.name,
     };
     norm(raw)
 }
@@ -26,8 +29,9 @@ fn rank(k: Kind) -> u8 {
         Kind::Deb | Kind::Rpm | Kind::Pacman => 0,
         Kind::Flatpak => 1,
         Kind::Snap => 2,
-        Kind::AppImage => 3,
-        Kind::Manual => 4,
+        Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => 3,
+        Kind::AppImage => 4,
+        Kind::Manual => 5,
     }
 }
 

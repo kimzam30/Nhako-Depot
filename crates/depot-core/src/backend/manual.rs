@@ -14,23 +14,60 @@ pub fn app_roots(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Sub-folders that are part of one app's layout, never an app of their own.
-const LAYOUT_DIRS: &[&str] = &["bin", "lib", "lib64", "libexec", "share", "resources", "usr", "opt"];
+/// Sub-folders that are part of one app's layout, never an app of their own, including the
+/// runtimes apps bundle (`jre/bin/java` doesn't make a second app).
+const LAYOUT_DIRS: &[&str] = &[
+    "bin",
+    "lib",
+    "lib64",
+    "libexec",
+    "share",
+    "resources",
+    "usr",
+    "opt",
+    "jre",
+    "jdk",
+    "jbr",
+    "java",
+    "node",
+    "nodejs",
+    "python",
+    "runtime",
+    "plugins",
+    "extensions",
+    "locales",
+];
 
 /// Whether `dir` only groups several apps (e.g. `~/Applications/tools/{a,b}`) rather than being
-/// one app's folder: it holds no files of its own, and another launcher's program lives in a
-/// different sub-folder than this program's.
+/// one app's folder: another launcher's program lives in a different sub-folder than this
+/// program's, or a sibling sub-folder holds a program of its own (an app nobody made a launcher
+/// for). A folder that can't be read counts as a group, so less is removed rather than more.
 fn groups_apps(dir: &Path, program: &Path, others: &[PathBuf]) -> bool {
     let Some(child) = program.strip_prefix(dir).ok().and_then(|r| r.components().next()) else { return false };
     let child = dir.join(child);
-    let layout = child.file_name().and_then(|n| n.to_str()).is_some_and(|n| LAYOUT_DIRS.contains(&n));
-    if layout || !child.is_dir() {
+    if is_layout(&child) || !child.is_dir() {
         return false;
     }
-    let other_app = others.iter().any(|o| o.starts_with(dir) && !o.starts_with(&child));
-    let has_files =
-        std::fs::read_dir(dir).map(|rd| rd.flatten().any(|e| e.file_type().is_ok_and(|t| !t.is_dir()))).unwrap_or(true);
-    other_app && !has_files
+    if others.iter().any(|o| o.starts_with(dir) && !o.starts_with(&child)) {
+        return true;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return true };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|s| *s != child && !is_layout(s) && s.is_dir() && !s.is_symlink())
+        .any(|s| has_program(&s) || has_program(&s.join("bin")))
+}
+
+fn is_layout(dir: &Path) -> bool {
+    dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| LAYOUT_DIRS.contains(&n))
+}
+
+/// Whether `dir` directly holds a file anyone may run.
+fn has_program(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| e.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+    })
 }
 
 /// The app's own folder under one of the roots: the first folder below the root that holds the
@@ -112,7 +149,7 @@ pub fn plan(
         files.push(dir.clone());
         files.extend(belongings(entry, dir, home, icon_users));
         // settings folders are only guessed when the launcher's name is the app's own name
-        let base = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
+        let base = entry.base_id();
         let lower = base.to_lowercase();
         let named = |p: Option<&std::ffi::OsStr>| p.and_then(|n| n.to_str()).is_some_and(|n| n.to_lowercase() == lower);
         if named(dir.file_name()) || named(program.and_then(Path::file_stem)) {
@@ -132,7 +169,7 @@ pub(crate) fn belongings(
     icon_users: &HashMap<String, usize>,
 ) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let base = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
+    let base = entry.base_id();
     let autostart = home.join(".config/autostart").join(&entry.id);
     if let Some(a) = DesktopEntry::load(&autostart, entry.id.clone())
         && let Some(exec::Target::Program { path, script, .. }) = exec::target(&a.argv(), &[])

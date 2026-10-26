@@ -1,13 +1,14 @@
 //! Uninstall flow for one app or several: check what would happen, confirm, run in the progress
 //! sheet, and say how it went.
 
-use super::operation::{self, Choice, Ending, ItemState, Operation};
+use super::operation::{self, Choice, Ending, Operation, Step};
 use super::{State, reload, select, widgets};
 use crate::packagekit;
-use crate::system::{Outcome, home, short};
+use crate::system::{Outcome, home, plural, short};
 use adw::prelude::*;
-use depot_core::backend::manual;
+use depot_core::backend::{brew, manual, nix};
 use depot_core::remove::{self as removal, RemovePlan};
+use depot_core::updates::pk_split;
 use depot_core::{Kind, Package};
 use gtk::{gio, glib};
 use std::collections::BTreeMap;
@@ -20,10 +21,6 @@ fn text(b: &[u8]) -> String {
 
 fn blocked(reason: impl Into<String>) -> RemovePlan {
     RemovePlan { blocked: Some(reason.into()), ..Default::default() }
-}
-
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// Run a dry run twice, without and with "also remove what's left unused", and build a plan
@@ -48,7 +45,12 @@ fn simulate(kind: Kind, ids: &[String]) -> RemovePlan {
         Kind::Pacman => {
             dry_runs(kind, "pacman", &["-Rcp", "--print-format", "%n"], &["-Rcsp", "--print-format", "%n"], ids)
         }
-        _ => blocked("Removing system packages here needs PackageKit, which isn't installed."),
+        Kind::Rpm | Kind::Snap | Kind::Flatpak | Kind::AppImage | Kind::Manual => {
+            blocked("Removing system packages here needs PackageKit, which isn't installed.")
+        }
+        Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => {
+            blocked("Removing system packages here needs PackageKit, which isn't installed.")
+        }
     }
 }
 
@@ -62,9 +64,8 @@ fn pk_target<'a>(found: &'a [packagekit::PkPackage], p: &Package) -> Option<&'a 
     found
         .iter()
         .find(|k| {
-            let mut f = k.id.split(';');
-            f.next() == Some(p.name.as_str())
-                && matches!(f.nth(1), Some(a) if a == p.arch || neutral(a) || neutral(&p.arch))
+            matches!(pk_split(&k.id), Some((name, _, a, _))
+                if name == p.name && (a == p.arch || neutral(a) || neutral(&p.arch)))
         })
         .map(|k| k.id.as_str())
 }
@@ -103,6 +104,30 @@ async fn plan_native(pkgs: &[Package]) -> RemovePlan {
     gio::spawn_blocking(move || simulate(kind, &ids)).await.unwrap_or_else(|_| blocked("The check crashed."))
 }
 
+/// Homebrew won't remove a formula another installed one needs; say so before asking, unless
+/// what needs it is being removed too.
+async fn brew_in_use(pkgs: &[Package]) -> Option<String> {
+    let names: Vec<String> = pkgs.iter().filter(|p| p.kind == Kind::Brew).map(|p| p.id.clone()).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let found = gio::spawn_blocking(move || {
+        let mut found = Vec::new();
+        for n in &names {
+            let users: Vec<String> =
+                brew::needed_by(n).unwrap_or_default().into_iter().filter(|u| !names.contains(u)).collect();
+            if !users.is_empty() {
+                found.push(format!("{n} is needed by {}", users.join(", ")));
+            }
+        }
+        found
+    })
+    .await
+    .unwrap_or_default();
+    (!found.is_empty())
+        .then(|| format!("Homebrew can't remove it while other software needs it: {}.", found.join("; ")))
+}
+
 /// Show a button as busy ("Checking…") until the returned guard is dropped.
 struct Busy(gtk::Button, Option<gtk::Widget>);
 
@@ -127,6 +152,11 @@ impl Drop for Busy {
 
 /// Start uninstalling `pkgs`: work out what would happen, then ask. `button` shows the check.
 pub fn start(st: &Rc<State>, pkgs: Vec<Package>, button: Option<&gtk::Button>) {
+    start_with(st, pkgs, button, None);
+}
+
+/// [`start`], with the boxes in the confirmation ticked the way they were last time (`prev`).
+fn start_with(st: &Rc<State>, pkgs: Vec<Package>, button: Option<&gtk::Button>, prev: Option<Choices>) {
     if pkgs.is_empty() {
         return;
     }
@@ -134,9 +164,12 @@ pub fn start(st: &Rc<State>, pkgs: Vec<Package>, button: Option<&gtk::Button>) {
     let st = st.clone();
     glib::spawn_future_local(async move {
         let natives: Vec<Package> = pkgs.iter().filter(|p| p.kind.is_native()).cloned().collect();
-        let plan = if natives.is_empty() { RemovePlan::default() } else { plan_native(&natives).await };
+        let mut plan = if natives.is_empty() { RemovePlan::default() } else { plan_native(&natives).await };
+        if plan.blocked.is_none() {
+            plan.blocked = brew_in_use(&pkgs).await;
+        }
         drop(busy);
-        confirm(&st, Rc::new(pkgs), plan);
+        confirm(&st, Rc::new(pkgs), plan, prev.as_ref());
     });
 }
 
@@ -163,6 +196,8 @@ fn notice_flag() -> std::path::PathBuf {
 #[derive(Clone, Default)]
 struct Choices {
     orphans: bool,
+    /// The user unticked "Also remove N packages", so "Try again" leaves it unticked.
+    orphans_unticked: bool,
     purge: Vec<Kind>,
     unused_runtimes: bool,
 }
@@ -173,16 +208,21 @@ fn group_name(k: Kind) -> &'static str {
         Kind::Snap => "Snaps",
         Kind::Flatpak => "Flatpaks",
         Kind::AppImage | Kind::Manual => "Moved to the Trash",
+        Kind::Cargo => "Cargo programs",
+        Kind::Npm => "npm packages",
+        Kind::Pipx => "pipx apps",
+        Kind::Brew => "Homebrew packages",
+        Kind::Nix => "Nix packages",
     }
 }
 
-fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
+fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, prev: Option<&Choices>) {
     if let Some(reason) = &plan.blocked {
         let heading = if pkgs.len() == 1 { "Can't uninstall" } else { "Can't uninstall these apps" };
         let body = if pkgs.len() == 1 {
             reason.clone()
         } else {
-            format!("{reason}\n\nUntick the system apps in your selection and try again.")
+            format!("{reason}\n\nUntick those in your selection and try again.")
         };
         let d = adw::AlertDialog::builder().heading(heading).body(body).build();
         d.add_response("close", "Close");
@@ -268,7 +308,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
     let orphans = &plan.orphans;
     let clean = gtk::CheckButton::builder()
         .label(format!("Also remove {} that nothing else needs any more", plural(orphans.len(), "package", "packages")))
-        .active(true)
+        .active(!prev.is_some_and(|c| c.orphans_unticked))
         .tooltip_text("These were installed automatically for other software that is no longer here.")
         .build();
     if !orphans.is_empty() {
@@ -303,10 +343,13 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
                 }
                 format!("Also move its settings and data to the Trash ({})", data.join(", "))
             }
+            // their own tools keep no settings to delete, or can't
             Kind::Rpm | Kind::AppImage => continue,
+            Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => continue,
         };
         let label = if single { label } else { label.replace("its ", "their ").replace(" of its", " of their") };
         let c = gtk::CheckButton::with_label(&label);
+        c.set_active(prev.is_some_and(|p| p.purge.contains(&k)));
         if !single {
             c.set_tooltip_text(Some(&format!("For the {} in this list", group_name(k).to_lowercase())));
         }
@@ -316,6 +359,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
     let unused = gtk::CheckButton::builder()
         .label("Also remove shared Flatpak runtimes that no app uses any more")
         .tooltip_text("Frees space. Apps that need a runtime again download it when they're installed.")
+        .active(prev.is_some_and(|c| c.unused_runtimes))
         .build();
     if kinds.contains(&Kind::Flatpak) {
         content.append(&unused);
@@ -347,8 +391,13 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
     };
     d.add_response("remove", &action(clean.is_active()));
     {
-        let d = d.clone();
-        clean.connect_toggled(move |c| d.set_response_label("remove", &action(c.is_active())));
+        // weak: the box is inside the dialog, so a strong reference would keep the dialog alive forever
+        let d = d.downgrade();
+        clean.connect_toggled(move |c| {
+            if let Some(d) = d.upgrade() {
+                d.set_response_label("remove", &action(c.is_active()));
+            }
+        });
     }
     d.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     d.set_default_response(Some("cancel"));
@@ -366,6 +415,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
         let choices = Choices {
             // only the leftovers that were listed, and only if the box was shown and ticked
             orphans: !plan.orphans.is_empty() && clean.is_active(),
+            orphans_unticked: !plan.orphans.is_empty() && !clean.is_active(),
             purge: purges.iter().filter(|(_, c)| c.is_active()).map(|(k, _)| *k).collect(),
             unused_runtimes: unused.is_active(),
         };
@@ -375,14 +425,31 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan) {
 
 async fn trash_manual(p: &Package, with_data: bool) -> Outcome {
     let plan = p.manual.clone().unwrap_or_default();
-    let h = home();
-    let shared = manual::app_roots(&h);
+    let mut targets = plan.files.clone();
+    if with_data {
+        targets.extend(plan.data.iter().cloned());
+    }
+    // the safety checks resolve links and read files, so they run off the main thread
+    let checked = gio::spawn_blocking(move || {
+        let h = home();
+        let shared = manual::app_roots(&h);
+        targets
+            .into_iter()
+            // already gone: nothing to do
+            .filter(|t| std::fs::symlink_metadata(t).is_ok())
+            .map(|t| {
+                let ok = removal::safe_target(&t, &h, &shared);
+                (t, ok)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    let Ok(checked) = checked else {
+        return Outcome::failed("Depot couldn't check which files are safe to move to the Trash.");
+    };
     let mut errors = Vec::new();
-    for t in plan.files.iter().chain(if with_data { plan.data.iter() } else { [].iter() }) {
-        if std::fs::symlink_metadata(t).is_err() {
-            continue;
-        }
-        if !removal::safe_target(t, &h, &shared) {
+    for (t, ok) in &checked {
+        if !ok {
             errors.push(format!("Refused to touch {}", t.display()));
             continue;
         }
@@ -397,12 +464,7 @@ async fn trash_manual(p: &Package, with_data: bool) -> Outcome {
     }
 }
 
-/// One step of an uninstall: the packages it covers, as indices into the list being removed.
-struct Step {
-    items: Vec<usize>,
-    how: How,
-}
-
+/// How one step of an uninstall is done. Its items are indices into the list being removed.
 enum How {
     PackageKit(Vec<String>),
     Command { cmd: Vec<String>, root: bool },
@@ -419,34 +481,59 @@ fn unused_runtimes_cmd(system: bool) -> Vec<String> {
     args(&["flatpak", "uninstall", "--unused", "-y", "--noninteractive", if system { "--system" } else { "--user" }])
 }
 
+/// A developer tool's own uninstall command, and whether it takes only one package per call.
+fn tool_uninstall(kind: Kind) -> Option<(Vec<String>, bool)> {
+    match kind {
+        Kind::Cargo => Some((args(&["cargo", "uninstall", "--"]), false)),
+        Kind::Npm => Some((args(&["npm", "uninstall", "-g", "--"]), false)),
+        Kind::Pipx => Some((args(&["pipx", "uninstall"]), true)),
+        Kind::Brew => Some((args(&["brew", "uninstall", "--"]), false)),
+        Kind::Nix => Some((args(&["nix", nix::FEATURES[0], nix::FEATURES[1], "profile", "remove"]), false)),
+        Kind::Deb | Kind::Rpm | Kind::Pacman | Kind::Snap | Kind::Flatpak | Kind::AppImage | Kind::Manual => None,
+    }
+}
+
 /// The steps that remove `pkgs` as planned and chosen.
-fn steps(pkgs: &[Package], plan: &RemovePlan, c: &Choices) -> Vec<Step> {
-    let mut out = Vec::new();
-    let pick = |f: &dyn Fn(&Package) -> bool| -> Vec<usize> { (0..pkgs.len()).filter(|&i| f(&pkgs[i])).collect() };
+fn steps(pkgs: &[Package], plan: &RemovePlan, c: &Choices) -> Vec<Step<How>> {
     let purge = |k: Kind| c.purge.contains(&k);
     let (orphans, orphan_pk_ids) =
         if c.orphans { (plan.orphans.clone(), plan.orphan_pk_ids.clone()) } else { (Vec::new(), Vec::new()) };
+    // every kind is sorted into a step here, so a new kind can't be quietly left out
+    let (mut natives, mut snaps, mut flats_system, mut flats_user, mut trashed) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (i, p) in pkgs.iter().enumerate() {
+        match p.kind {
+            Kind::Deb | Kind::Rpm | Kind::Pacman => natives.push(i),
+            Kind::Snap => snaps.push(i),
+            Kind::Flatpak if p.system => flats_system.push(i),
+            Kind::Flatpak => flats_user.push(i),
+            Kind::AppImage | Kind::Manual => trashed.push(i),
+            // each removed with its own command, below
+            Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => {}
+        }
+    }
 
-    let natives = pick(&|p| p.kind.is_native());
+    let mut out = Vec::new();
     if !natives.is_empty() {
         let kind = pkgs[natives[0]].kind;
         let ids: Vec<String> = natives.iter().map(|&i| pkgs[i].id.clone()).collect();
+        let packagekit = || How::PackageKit(plan.pk_ids.iter().chain(&orphan_pk_ids).cloned().collect());
         // PackageKit can't purge settings files, so purging goes through apt or pacman
         let how = if !plan.pk_ids.is_empty() && !purge(kind) {
-            How::PackageKit(plan.pk_ids.iter().chain(&orphan_pk_ids).cloned().collect())
+            packagekit()
         } else {
             match kind {
                 Kind::Deb => How::Command { cmd: removal::apt_command(&ids, purge(kind), &orphans), root: true },
                 Kind::Pacman => {
                     How::Command { cmd: removal::pacman_command(&ids, purge(kind), &plan.deps, &orphans), root: true }
                 }
-                // RPM is only ever removed through PackageKit (see `simulate`)
-                _ => How::PackageKit(plan.pk_ids.iter().chain(&orphan_pk_ids).cloned().collect()),
+                // RPM is only ever removed through PackageKit (see `simulate`); the rest aren't native
+                Kind::Rpm | Kind::Snap | Kind::Flatpak | Kind::AppImage | Kind::Manual => packagekit(),
+                Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => packagekit(),
             }
         };
-        out.push(Step { items: natives, how });
+        out.push(Step { items: natives, work: how });
     }
-    let snaps = pick(&|p| p.kind == Kind::Snap);
     if !snaps.is_empty() {
         let mut cmd = args(&["snap", "remove"]);
         if purge(Kind::Snap) {
@@ -454,10 +541,9 @@ fn steps(pkgs: &[Package], plan: &RemovePlan, c: &Choices) -> Vec<Step> {
         }
         cmd.push("--".into());
         cmd.extend(snaps.iter().map(|&i| pkgs[i].id.clone()));
-        out.push(Step { items: snaps, how: How::Command { cmd, root: true } });
+        out.push(Step { items: snaps, work: How::Command { cmd, root: true } });
     }
-    for system in [true, false] {
-        let flats = pick(&|p| p.kind == Kind::Flatpak && p.system == system);
+    for (system, flats) in [(true, flats_system), (false, flats_user)] {
         if flats.is_empty() {
             continue;
         }
@@ -469,13 +555,24 @@ fn steps(pkgs: &[Package], plan: &RemovePlan, c: &Choices) -> Vec<Step> {
         cmd.push("--".into());
         cmd.extend(flats.iter().map(|&i| pkgs[i].id.clone()));
         // Flatpak asks for the password itself for apps installed for everyone
-        out.push(Step { items: flats.clone(), how: How::Command { cmd, root: false } });
+        out.push(Step { items: flats, work: How::Command { cmd, root: false } });
         if c.unused_runtimes {
-            out.push(Step { items: Vec::new(), how: How::Command { cmd: unused_runtimes_cmd(system), root: false } });
+            out.push(Step { items: Vec::new(), work: How::Command { cmd: unused_runtimes_cmd(system), root: false } });
         }
     }
-    for i in pick(&|p| p.kind.trashes()) {
-        out.push(Step { items: vec![i], how: How::Trash { with_data: purge(Kind::Manual) } });
+    for kind in Kind::ALL {
+        let Some((base, one_each)) = tool_uninstall(kind) else { continue };
+        let items: Vec<usize> = (0..pkgs.len()).filter(|&i| pkgs[i].kind == kind).collect();
+        let groups: Vec<Vec<usize>> = if one_each { items.into_iter().map(|i| vec![i]).collect() } else { vec![items] };
+        for items in groups.into_iter().filter(|g| !g.is_empty()) {
+            let mut cmd = base.clone();
+            cmd.extend(items.iter().map(|&i| pkgs[i].id.clone()));
+            // developer tools install for you alone, so their own commands never need a password
+            out.push(Step { items, work: How::Command { cmd, root: false } });
+        }
+    }
+    for i in trashed {
+        out.push(Step { items: vec![i], work: How::Trash { with_data: purge(Kind::Manual) } });
     }
     out
 }
@@ -503,26 +600,11 @@ fn run(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, choices: Choice
     let op = Operation::show(&st.win, &title, &item_names(&pkgs));
     let st = st.clone();
     glib::spawn_future_local(async move {
-        let mut removed = vec![false; pkgs.len()];
-        let mut failures: Vec<(Vec<usize>, Outcome)> = Vec::new();
-        let mut stopped = false;
-        for step in steps(&pkgs, &plan, &choices) {
-            if stopped {
-                for &i in &step.items {
-                    op.item(i, ItemState::Skipped, "Not started");
-                }
-                continue;
-            }
-            for &i in &step.items {
-                op.item(i, ItemState::Working, "");
-            }
+        let steps = steps(&pkgs, &plan, &choices);
+        let note = |how: &How| if matches!(how, How::Trash { .. }) { "Moved to Trash" } else { "Removed" };
+        let ran = operation::run_steps(&op, pkgs.len(), steps, note, async |step: &Step<How>| {
             let first = step.items.first().map(|&i| pkgs[i].title.clone()).unwrap_or_default();
-            let working = match step.items.len() {
-                0 => "Removing unused runtimes…".to_string(),
-                1 => format!("Removing {first}…"),
-                n => format!("Removing {n} apps…"),
-            };
-            let o = match &step.how {
+            match &step.work {
                 How::PackageKit(ids) => {
                     op.progress("Preparing…", None);
                     let cancel = gio::Cancellable::new();
@@ -533,38 +615,21 @@ fn run(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, choices: Choice
                     }
                 }
                 How::Command { cmd, root } => {
-                    let may_ask = cmd.first().is_some_and(|c| c == "flatpak") && cmd.iter().any(|a| a == "--system");
-                    op.set_hint(if may_ask { "You may be asked for your password." } else { "" });
+                    let working = match step.items.len() {
+                        0 => "Removing unused runtimes…".to_string(),
+                        1 => format!("Removing {first}…"),
+                        n => format!("Removing {n} apps…"),
+                    };
                     operation::command(&op, cmd, *root, &working).await
                 }
                 How::Trash { with_data } => {
                     op.progress(&format!("Moving {first} to the Trash…"), None);
                     trash_manual(&pkgs[step.items[0]], *with_data).await
                 }
-            };
-            let note_done = if matches!(step.how, How::Trash { .. }) { "Moved to Trash" } else { "Removed" };
-            match &o {
-                Outcome::Done => {
-                    for &i in &step.items {
-                        removed[i] = true;
-                        op.item(i, ItemState::Done, note_done);
-                    }
-                }
-                Outcome::Cancelled => {
-                    stopped = true;
-                    for &i in &step.items {
-                        op.item(i, ItemState::Skipped, "Cancelled");
-                    }
-                    failures.push((step.items.clone(), o));
-                }
-                Outcome::Failed { .. } => {
-                    for &i in &step.items {
-                        op.item(i, ItemState::Failed, "Failed");
-                    }
-                    failures.push((step.items.clone(), o));
-                }
             }
-        }
+        })
+        .await;
+        let (removed, failures) = (ran.done, ran.failures);
         let changed = removed.iter().any(|&r| r);
         let left: Vec<Package> = pkgs.iter().zip(&removed).filter(|(_, r)| !**r).map(|(p, _)| p.clone()).collect();
         let r = result(&pkgs, &removed, &failures);
@@ -576,7 +641,7 @@ fn run(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, choices: Choice
         }
         if retry {
             op.close();
-            start(&st, left, None);
+            start_with(&st, left, None, Some(choices));
         }
     });
 }
@@ -587,11 +652,7 @@ pub fn clean_up_runtimes(st: &Rc<State>, runtimes: Vec<Package>) {
         return;
     }
     let size: u64 = runtimes.iter().map(|p| p.size).sum();
-    let heading = if runtimes.len() == 1 {
-        "Remove 1 unused runtime?".to_string()
-    } else {
-        format!("Remove {} unused runtimes?", runtimes.len())
-    };
+    let heading = format!("Remove {}?", plural(runtimes.len(), "unused runtime", "unused runtimes"));
     let d = adw::AlertDialog::builder()
         .heading(heading)
         .body(format!(
@@ -627,33 +688,26 @@ fn run_clean_up(st: &Rc<State>, runtimes: Rc<Vec<Package>>) {
     let op = Operation::show(&st.win, "Removing unused runtimes", &names);
     let st = st.clone();
     glib::spawn_future_local(async move {
-        let mut removed = vec![false; runtimes.len()];
-        let mut failures: Vec<(Vec<usize>, Outcome)> = Vec::new();
-        for system in [true, false] {
-            let items: Vec<usize> = (0..runtimes.len()).filter(|&i| runtimes[i].system == system).collect();
-            if items.is_empty() {
-                continue;
-            }
-            if failures.iter().any(|(_, o)| matches!(o, Outcome::Cancelled)) {
-                items.iter().for_each(|&i| op.item(i, ItemState::Skipped, "Not started"));
-                continue;
-            }
-            items.iter().for_each(|&i| op.item(i, ItemState::Working, ""));
-            op.set_hint(if system { "You may be asked for your password." } else { "" });
-            let o = operation::command(&op, &unused_runtimes_cmd(system), false, "Removing unused runtimes…").await;
-            let (state, note) = match o {
-                Outcome::Done => (ItemState::Done, "Removed"),
-                Outcome::Cancelled => (ItemState::Skipped, "Cancelled"),
-                Outcome::Failed { .. } => (ItemState::Failed, "Failed"),
-            };
-            for &i in &items {
-                removed[i] = state == ItemState::Done;
-                op.item(i, state, note);
-            }
-            if !matches!(o, Outcome::Done) {
-                failures.push((items, o));
-            }
-        }
+        // one step per installation, system-wide first
+        let steps: Vec<Step<bool>> = [true, false]
+            .into_iter()
+            .map(|system| Step {
+                items: (0..runtimes.len()).filter(|&i| runtimes[i].system == system).collect(),
+                work: system,
+            })
+            .filter(|s| !s.items.is_empty())
+            .collect();
+        let ran = operation::run_steps(
+            &op,
+            runtimes.len(),
+            steps,
+            |_| "Removed",
+            async |step: &Step<bool>| {
+                operation::command(&op, &unused_runtimes_cmd(step.work), false, "Removing unused runtimes…").await
+            },
+        )
+        .await;
+        let (removed, failures) = (ran.done, ran.failures);
         let mut r = result(&runtimes, &removed, &failures);
         let done = removed.iter().filter(|&&d| d).count();
         // `result` speaks of apps; say runtimes instead
@@ -701,18 +755,29 @@ fn result(pkgs: &[Package], removed: &[bool], failures: &[(Vec<usize>, Outcome)]
         .collect();
     let not_removed: Vec<&str> =
         pkgs.iter().zip(removed).filter(|(_, r)| !**r).map(|(p, _)| p.title.as_str()).collect();
-    let (ending, heading, body) = if failures.is_empty() || done == n && !cancelled {
+    // a step that covers no app itself (removing unused runtimes afterwards)
+    let extra_failed = failures.iter().any(|(items, o)| items.is_empty() && matches!(o, Outcome::Failed { .. }));
+    let extra_cancelled = failures.iter().any(|(items, o)| items.is_empty() && matches!(o, Outcome::Cancelled));
+    let (ending, heading, body) = if done == n {
         let heading = match (n, pkgs[0].kind) {
             (1, k) if k.trashes() => format!("{} was moved to the Trash", pkgs[0].title),
             (1, _) => format!("{} was uninstalled", pkgs[0].title),
             _ => format!("{n} apps were uninstalled"),
         };
-        (Ending::Success, heading, format!("{freed}{restore}").trim().to_string())
+        let mut body = format!("{freed}{restore}");
+        if extra_failed {
+            body.push_str(&format!(" The unused runtimes couldn't be removed. {summary}"));
+        } else if extra_cancelled {
+            body.push_str(" Removing the unused runtimes was cancelled.");
+        }
+        // anything left undone stays on screen instead of closing by itself
+        let ending = if extra_failed || extra_cancelled { Ending::Partial } else { Ending::Success };
+        (ending, heading, body.trim().to_string())
     } else if done == 0 && cancelled {
         (
             Ending::Cancelled,
             "Nothing was changed".to_string(),
-            "The password wasn't entered, so nothing was removed.".to_string(),
+            "Nothing was removed: the password wasn't entered, or the uninstall was cancelled.".to_string(),
         )
     } else if done == 0 {
         let heading = if n == 1 { format!("Couldn't uninstall {}", pkgs[0].title) } else { "Uninstall failed".into() };
@@ -729,7 +794,9 @@ fn result(pkgs: &[Package], removed: &[bool], failures: &[(Vec<usize>, Outcome)]
             ),
         )
     };
-    operation::Result { ending, heading, body, details: details.join("\n\n"), retry: ending != Ending::Success }
+    // "Try again" retries the apps still installed, so there's nothing to retry once they're all gone
+    let retry = ending != Ending::Success && done < n;
+    operation::Result { ending, heading, body, details: details.join("\n\n"), retry }
 }
 
 #[cfg(test)]
@@ -759,9 +826,9 @@ mod tests {
         let s = steps(&pkgs, &plan, &Choices::default());
         let items: Vec<Vec<usize>> = s.iter().map(|s| s.items.clone()).collect();
         assert_eq!(items, vec![vec![0], vec![1, 2], vec![3], vec![4], vec![5], vec![6]]);
-        assert!(matches!(s[5].how, How::Trash { .. }), "AppImages go to the Trash");
-        assert!(matches!(&s[0].how, How::PackageKit(ids) if ids.len() == 1));
-        match &s[1].how {
+        assert!(matches!(s[5].work, How::Trash { .. }), "AppImages go to the Trash");
+        assert!(matches!(&s[0].work, How::PackageKit(ids) if ids.len() == 1));
+        match &s[1].work {
             How::Command { cmd, root } => {
                 assert!(*root);
                 assert_eq!(cmd, &args(&["snap", "remove", "--", "spotify", "code"]));
@@ -771,11 +838,41 @@ mod tests {
     }
 
     #[test]
+    fn developer_tools_use_their_own_commands_without_a_password() {
+        let pkgs = vec![
+            pkg(Kind::Pipx, "black"),
+            pkg(Kind::Cargo, "ripgrep"),
+            pkg(Kind::Pipx, "httpie"),
+            pkg(Kind::Cargo, "bat"),
+            pkg(Kind::Npm, "typescript"),
+        ];
+        let s = steps(&pkgs, &RemovePlan::default(), &Choices::default());
+        let cmds: Vec<(Vec<usize>, String)> = s
+            .iter()
+            .map(|s| match &s.work {
+                How::Command { cmd, root: false } => (s.items.clone(), cmd.join(" ")),
+                _ => panic!("developer tools run as you"),
+            })
+            .collect();
+        assert_eq!(
+            cmds,
+            [
+                (vec![1, 3], "cargo uninstall -- ripgrep bat".to_string()),
+                (vec![4], "npm uninstall -g -- typescript".to_string()),
+                (vec![0], "pipx uninstall black".to_string()),
+                (vec![2], "pipx uninstall httpie".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn purging_a_deb_goes_through_apt() {
         let pkgs = vec![pkg(Kind::Deb, "vlc")];
         let plan = RemovePlan { pk_ids: vec!["vlc;1;amd64;installed".into()], ..Default::default() };
         let c = Choices { purge: vec![Kind::Deb], ..Default::default() };
-        assert!(matches!(&steps(&pkgs, &plan, &c)[0].how, How::Command { cmd, .. } if cmd[1] == "purge"));
+        assert!(
+            matches!(&steps(&pkgs, &plan, &c)[0].work, How::Command { cmd, .. } if cmd.iter().any(|a| a == "purge"))
+        );
     }
 
     #[test]
@@ -788,5 +885,11 @@ mod tests {
         assert!(all.ending == Ending::Success && all.heading == "2 apps were uninstalled");
         let none = result(&pkgs[..1], &[false], &[(vec![0], Outcome::Cancelled)]);
         assert!(none.ending == Ending::Cancelled);
+        // every app went, but the clean-up afterwards didn't: say so, with nothing to retry
+        let cleanup = result(&pkgs, &[true, true], &[(vec![], Outcome::failed("flatpak: error"))]);
+        assert!(cleanup.ending == Ending::Partial && !cleanup.retry);
+        assert!(cleanup.body.contains("unused runtimes couldn't be removed"), "{}", cleanup.body);
+        let stopped = result(&pkgs, &[true, true], &[(vec![], Outcome::Cancelled)]);
+        assert!(stopped.ending == Ending::Partial && !stopped.retry && !stopped.body.contains(" are still installed"));
     }
 }

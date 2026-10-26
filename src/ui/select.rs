@@ -88,6 +88,11 @@ impl Selection {
         self.cards.borrow_mut().insert(card.clone(), k);
     }
 
+    /// The grid threw a card away.
+    pub fn forget(&self, card: &gtk::Overlay) {
+        self.cards.borrow_mut().remove(card);
+    }
+
     fn show(&self, card: &gtk::Overlay, k: &str) {
         let (bx, tick) = widgets::card_parts(card);
         let picked = self.on.get() && self.keys.borrow().contains(k);

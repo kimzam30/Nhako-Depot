@@ -3,6 +3,7 @@
 //! saying exactly how it went, so nothing finishes silently.
 
 use super::widgets::{label, wrapped};
+use crate::system::Outcome;
 use adw::prelude::*;
 use futures_channel::oneshot;
 use gtk::{gio, glib};
@@ -71,6 +72,8 @@ pub struct Operation {
     choice: RefCell<Option<oneshot::Sender<Choice>>>,
     hovered: gtk::EventControllerMotion,
     closed: Rc<Cell<bool>>,
+    /// Something was already changed, so "Nothing has changed yet" would be wrong.
+    changed: Cell<bool>,
 }
 
 struct ResultPage {
@@ -286,6 +289,7 @@ impl Operation {
             choice: RefCell::new(None),
             hovered,
             closed,
+            changed: Cell::new(false),
         });
         {
             let w = Rc::downgrade(&op);
@@ -374,7 +378,7 @@ impl Operation {
     pub fn checking(&self, text: &str) {
         self.show_phase("busy");
         self.status.set_text(text);
-        self.set_hint("Nothing has changed yet.");
+        self.set_hint(if self.changed.get() { "" } else { "Nothing has changed yet." });
         self.pulsing.set(true);
     }
 
@@ -407,13 +411,7 @@ impl Operation {
 
     /// What's happening now (empty text keeps the old line) and how far along (`None` = unknown).
     pub fn progress(&self, text: &str, fraction: Option<f64>) {
-        if self.phase.visible_child_name().as_deref() == Some("lock") {
-            self.set_hint("");
-        }
-        self.show_phase("busy");
-        if !text.is_empty() {
-            self.status.set_text(text);
-        }
+        self.working_on(text);
         match fraction {
             Some(f) => {
                 self.pulsing.set(false);
@@ -428,6 +426,9 @@ impl Operation {
 
     /// Mark item `i` of the checklist, with a short note ("Removed", "Couldn't remove").
     pub fn item(&self, i: usize, state: ItemState, note: &str) {
+        if state == ItemState::Done {
+            self.changed.set(true);
+        }
         let Some(r) = self.rows.get(i) else { return };
         r.state.set_visible_child_name(match state {
             ItemState::Working => "working",
@@ -438,12 +439,26 @@ impl Operation {
         r.note.set_text(note);
     }
 
-    /// Offer Cancel while `c` can still stop the work; `None` hides it.
+    /// Offer Cancel while `c` can still stop the work; `None` hides it. Once Cancel was pressed
+    /// it keeps saying "Cancelling…", however often the package manager says it can be cancelled.
     pub fn cancellable(&self, c: Option<&gio::Cancellable>) {
         *self.cancellable.borrow_mut() = c.cloned();
+        let asked = c.is_some_and(|c| c.is_cancelled());
         self.cancel.set_visible(c.is_some());
-        self.cancel.set_sensitive(true);
-        self.cancel.set_label("Cancel");
+        self.cancel.set_sensitive(!asked);
+        self.cancel.set_label(if asked { "Cancelling…" } else { "Cancel" });
+    }
+
+    /// What's being worked on right now (empty text keeps the old line), without touching the
+    /// progress bar.
+    pub fn working_on(&self, text: &str) {
+        if self.phase.visible_child_name().as_deref() == Some("lock") {
+            self.set_hint("");
+        }
+        self.show_phase("busy");
+        if !text.is_empty() {
+            self.status.set_text(text);
+        }
     }
 
     /// Show how it went and wait for the user's choice. A plain success closes by itself after a
@@ -502,15 +517,11 @@ impl Operation {
                 }
             });
         }
-        let c = rx.await.unwrap_or(Choice::Done);
-        if c == Choice::Retry {
-            self.reset();
-        }
-        c
+        rx.await.unwrap_or(Choice::Done)
     }
 
-    /// Back to the working page for another go.
-    fn reset(&self) {
+    /// Back to the working page for another go in the same sheet, after "Try again".
+    pub fn reset(&self) {
         self.dialog.set_can_close(false);
         self.authorized.set_reveal_child(false);
         self.bar.set_fraction(0.0);
@@ -542,7 +553,8 @@ pub fn pk_reporter(
             if asked.replace(false) {
                 op.authorized();
             }
-            op.progress(&working(p.name()), None);
+            // PackageKit sends these between percentages: the bar keeps its place
+            op.working_on(&working(p.name()));
         }
         Report::Fraction(f) => {
             if asked.replace(false) {
@@ -554,15 +566,75 @@ pub fn pk_reporter(
     }
 }
 
+/// One piece of work in the sheet: the checklist items it covers, and what does it.
+pub struct Step<W> {
+    pub items: Vec<usize>,
+    pub work: W,
+}
+
+/// How a run of steps went.
+pub struct Ran<W> {
+    /// Checklist items whose step worked.
+    pub done: Vec<bool>,
+    /// The steps that failed or were cancelled: their items and how they ended.
+    pub failures: Vec<(Vec<usize>, Outcome)>,
+    /// Steps that didn't work or never started, for "Try again".
+    pub left: Vec<Step<W>>,
+}
+
+/// Run `steps` one after another, marking their items in the checklist of `n` items. Once one is
+/// cancelled the rest aren't started. `done_note` is what a finished item says ("Removed").
+pub async fn run_steps<W>(
+    op: &Rc<Operation>,
+    n: usize,
+    steps: Vec<Step<W>>,
+    done_note: impl Fn(&W) -> &'static str,
+    mut run: impl AsyncFnMut(&Step<W>) -> Outcome,
+) -> Ran<W> {
+    let mut ran = Ran { done: vec![false; n], failures: Vec::new(), left: Vec::new() };
+    let mut stopped = false;
+    for step in steps {
+        if stopped {
+            step.items.iter().for_each(|&i| op.item(i, ItemState::Skipped, "Not started"));
+            ran.left.push(step);
+            continue;
+        }
+        step.items.iter().for_each(|&i| op.item(i, ItemState::Working, ""));
+        // a hint from the step before, or from the check beforehand, is about something else
+        op.set_hint("");
+        let o = run(&step).await;
+        let (state, note) = match &o {
+            Outcome::Done => (ItemState::Done, done_note(&step.work)),
+            Outcome::Cancelled => (ItemState::Skipped, "Cancelled"),
+            Outcome::Failed { .. } => (ItemState::Failed, "Failed"),
+        };
+        for &i in &step.items {
+            ran.done[i] = state == ItemState::Done;
+            op.item(i, state, note);
+        }
+        if !matches!(o, Outcome::Done) {
+            stopped |= matches!(o, Outcome::Cancelled);
+            ran.failures.push((step.items.clone(), o));
+            ran.left.push(step);
+        }
+    }
+    ran
+}
+
 /// Run a package-manager command (as root when `root` is set) inside the sheet: it shows the
 /// password step, then `working`, then the command's own short progress lines.
-pub async fn command(op: &Rc<Operation>, cmd: &[String], root: bool, working: &str) -> crate::system::Outcome {
+pub async fn command(op: &Rc<Operation>, cmd: &[String], root: bool, working: &str) -> Outcome {
     use crate::system::{self, Step};
     let cancel = gio::Cancellable::new();
+    // Flatpak asks for the password itself for what's installed for everyone
+    let may_ask = !root && cmd.first().is_some_and(|c| c == "flatpak") && cmd.iter().any(|a| a == "--system");
     if root {
         op.waiting_for_password();
     } else {
         op.progress(working, None);
+    }
+    if may_ask {
+        op.set_hint("You may be asked for your password.");
     }
     // a root command can only be stopped before the password is entered
     op.cancellable(Some(&cancel));
@@ -575,12 +647,18 @@ pub async fn command(op: &Rc<Operation>, cmd: &[String], root: bool, working: &s
         Step::Line(l) => {
             // progress bars redraw with \r; the last frame is the current one
             let l = l.rsplit('\r').next().unwrap_or(l).trim();
-            if !l.is_empty() && l.chars().count() <= 90 {
+            // apt waiting for Software or automatic updates to let go of the package database
+            if l.starts_with("Waiting for cache lock") {
+                op.waiting_for_lock();
+            } else if !l.is_empty() && l.chars().count() <= 90 {
                 op.progress(l, None);
             }
         }
     })
     .await;
     op.cancellable(None);
+    if may_ask {
+        op.set_hint("");
+    }
     r
 }

@@ -23,6 +23,9 @@ pub fn app_dirs(home: &Path) -> Vec<PathBuf> {
         home.join(".local/share/flatpak/exports/share"),
         PathBuf::from("/var/lib/flatpak/exports/share"),
         PathBuf::from("/var/lib/snapd/desktop"),
+        // Nix adds these to XDG_DATA_DIRS in its own shell setup, which the desktop may not run
+        home.join(".nix-profile/share"),
+        PathBuf::from("/nix/var/nix/profiles/default/share"),
     ]);
     let mut out: Vec<PathBuf> = Vec::new();
     for r in roots {

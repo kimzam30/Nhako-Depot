@@ -11,17 +11,26 @@ const NAME: &str = "org.freedesktop.PackageKit";
 const TX_IFACE: &str = "org.freedesktop.PackageKit.Transaction";
 
 /// Transaction flags and filters are bitfields of `1 << enum value`.
-pub const ONLY_TRUSTED: u64 = 1 << 1;
-pub const SIMULATE: u64 = 1 << 2;
-pub const FILTER_NONE: u64 = 1 << 1;
-pub const FILTER_INSTALLED: u64 = 1 << 2;
+const ONLY_TRUSTED: u64 = 1 << 1;
+const SIMULATE: u64 = 1 << 2;
+const FILTER_NONE: u64 = 1 << 1;
+const FILTER_INSTALLED: u64 = 1 << 2;
 
 const EXIT_SUCCESS: u32 = 1;
 const EXIT_CANCELLED: u32 = 3;
-const ERROR_NOT_AUTHORIZED: u32 = 48;
-const ERROR_TRANSACTION_CANCELLED: u32 = 17;
+/// Another, more important transaction (such as a security update) pushed this one out.
+const EXIT_CANCELLED_PRIORITY: u32 = 9;
+
+/// Error codes (PkErrorEnum) that Depot reacts to or explains.
+pub const ERROR_NO_NETWORK: u32 = 2;
 pub const ERROR_DEP_RESOLUTION_FAILED: u32 = 13;
+const ERROR_TRANSACTION_CANCELLED: u32 = 17;
 pub const ERROR_CANNOT_REMOVE_SYSTEM_PACKAGE: u32 = 20;
+pub const ERROR_CANNOT_GET_LOCK: u32 = 26;
+pub const ERROR_NO_SPACE_ON_DEVICE: u32 = 46;
+const ERROR_NOT_AUTHORIZED: u32 = 48;
+pub const ERROR_CANNOT_FETCH_SOURCES: u32 = 64;
+pub const ERROR_LOCK_REQUIRED: u32 = 67;
 
 /// Transaction `Status` values (PkStatusEnum) that change what the user is told.
 pub const STATUS_WAITING_FOR_LOCK: u32 = 30;
@@ -35,7 +44,7 @@ pub struct PkPackage {
 
 impl PkPackage {
     pub fn name(&self) -> &str {
-        self.id.split(';').next().unwrap_or(&self.id)
+        depot_core::updates::pk_split(&self.id).map_or(self.id.as_str(), |(name, ..)| name)
     }
 }
 
@@ -66,6 +75,8 @@ enum Event {
     Progress(u32),
     Status(u32),
     AllowCancel(bool),
+    /// The PackageKit service itself went away (it crashed or was restarted).
+    Lost,
 }
 
 /// What a running transaction reports.
@@ -113,8 +124,11 @@ async fn transaction(interactive: bool) -> Result<gio::DBusProxy, PkError> {
             .await
             .map_err(err)?;
     let r = main.call_future("CreateTransaction", None, gio::DBusCallFlags::NONE, 10_000).await.map_err(err)?;
-    let path =
-        r.child_value(0).str().map(str::to_string).ok_or_else(|| PkError::plain("PackageKit sent a bad reply"))?;
+    // checked before reading it: child_value would panic on an empty reply
+    let path = r
+        .get::<(glib::variant::ObjectPath,)>()
+        .map(|(p,)| p.as_str().to_string())
+        .ok_or_else(|| PkError::plain("PackageKit sent a bad reply"))?;
     let tx =
         gio::DBusProxy::for_bus_future(gio::BusType::System, gio::DBusProxyFlags::NONE, None, NAME, &path, TX_IFACE)
             .await
@@ -135,16 +149,28 @@ pub async fn run(
     report: impl Fn(Report<'_>) + 'static,
 ) -> Result<Vec<PkPackage>, PkError> {
     let tx = transaction(interactive).await?;
+    let (send, recv) = mpsc::unbounded::<Event>();
     let stop = {
-        let tx = tx.clone();
+        let (tx, send) = (tx.clone(), send.clone());
         cancel.connect_cancelled_local(move |_| {
-            let tx = tx.clone();
+            let (tx, send) = (tx.clone(), send.clone());
             glib::spawn_future_local(async move {
-                let _ = tx.call_future("Cancel", None, gio::DBusCallFlags::NONE, 10_000).await;
+                // refused (it can't stop right now): stop offering Cancel rather than say "Cancelling…" forever
+                if tx.call_future("Cancel", None, gio::DBusCallFlags::NONE, 10_000).await.is_err() {
+                    let _ = send.unbounded_send(Event::AllowCancel(false));
+                }
             });
         })
     };
-    let (send, recv) = mpsc::unbounded::<Event>();
+    // without this, a PackageKit crash mid-transaction would leave the sheet waiting forever
+    {
+        let send = send.clone();
+        tx.connect_notify_local(Some("g-name-owner"), move |tx, _| {
+            if tx.name_owner().is_none() {
+                let _ = send.unbounded_send(Event::Lost);
+            }
+        });
+    }
     let s = send.clone();
     tx.connect_g_signal(move |_, _, signal, params| {
         let ev = match signal {
@@ -205,6 +231,14 @@ async fn events(
             Event::AllowCancel(c) => report(Report::CanCancel(c)),
             Event::Error(c, d) => error = Some((c, d)),
             Event::Finished(EXIT_SUCCESS) => return Ok(packages),
+            Event::Finished(EXIT_CANCELLED_PRIORITY) => {
+                return Err(PkError {
+                    code: ERROR_CANNOT_GET_LOCK,
+                    details: "Another software update took priority and stopped this one.".into(),
+                    cancelled: false,
+                });
+            }
+            Event::Lost => return Err(PkError::plain("PackageKit stopped unexpectedly while it was working.")),
             Event::Finished(exit) => {
                 let (code, details) = error.unwrap_or((0, "The package manager stopped without saying why.".into()));
                 let cancelled =

@@ -15,7 +15,8 @@ const HELP: &str = "Usage: depot [OPTION]
   --simulate-remove NAME    Show what removing a system package would remove (changes nothing)
   --simulate-update         Show what installing all system updates would touch (changes nothing)
   --unused-runtimes         Print the Flatpak runtimes no app needs any more as JSON (changes nothing)
-  --version                 Print the version";
+  --version                 Print the version
+  --help                    Show this help";
 
 fn print_json(v: &impl serde::Serialize) {
     match serde_json::to_string_pretty(v) {
@@ -48,8 +49,18 @@ fn headless(args: &[String]) -> Option<glib::ExitCode> {
             let r = ctx.block_on(async {
                 let ids = packagekit::resolve_installed(std::slice::from_ref(name)).await?;
                 let ids: Vec<String> = ids.into_iter().map(|p| p.id).collect();
-                packagekit::simulate_remove(&ids, true).await
+                if ids.is_empty() {
+                    return Ok(None);
+                }
+                packagekit::simulate_remove(&ids, true).await.map(Some)
             });
+            let r = match r {
+                Ok(None) => {
+                    eprintln!("{name} isn't installed as a system package");
+                    return Some(glib::ExitCode::FAILURE);
+                }
+                r => r.map(Option::unwrap_or_default),
+            };
             match r {
                 Ok(pk) => pk.iter().for_each(|p| println!("{:>2} {}", p.info, p.id)),
                 Err(e) => {
@@ -61,6 +72,10 @@ fn headless(args: &[String]) -> Option<glib::ExitCode> {
         "--simulate-update" => {
             let r = ctx.block_on(async {
                 let ids: Vec<String> = packagekit::get_updates().await?.into_iter().map(|p| p.id).collect();
+                // nothing to update: nothing would change
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
                 packagekit::simulate_update(&ids).await
             });
             match r {
@@ -73,6 +88,11 @@ fn headless(args: &[String]) -> Option<glib::ExitCode> {
         }
         "--version" => println!("depot {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{HELP}"),
+        // a mistyped option would otherwise quietly open the window
+        f if f.starts_with('-') => {
+            eprintln!("depot: unknown option {f}\n\n{HELP}");
+            return Some(glib::ExitCode::from(2));
+        }
         _ => return None,
     }
     Some(glib::ExitCode::SUCCESS)
@@ -86,5 +106,5 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(ui::activate);
     // our own flags are handled above; don't let GTK reject them
-    app.run_with_args(&args[..1])
+    app.run_with_args(args.get(..1).unwrap_or_default())
 }

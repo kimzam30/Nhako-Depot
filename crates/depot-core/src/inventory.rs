@@ -1,6 +1,6 @@
 //! Builds the full list of installed software and decides which launcher belongs to which package.
 
-use crate::backend::{appimage, dpkg, flatpak, manual, pacman, rpm, snap};
+use crate::backend::{appimage, brew, cargo, dpkg, flatpak, manual, nix, npm, pacman, pipx, rpm, snap};
 use crate::exec::{self, Target};
 use crate::model::{Kind, Package, Role};
 use crate::xdg::{self, Launcher};
@@ -30,6 +30,10 @@ pub struct Env {
     pub flatpak: bool,
     pub flatpak_share: Vec<PathBuf>,
     pub cache_dir: Option<PathBuf>,
+    /// The cargo folder (`~/.cargo`), whose record of `cargo install`s is read directly.
+    pub cargo_home: Option<PathBuf>,
+    /// Ask npm, pipx, Homebrew and Nix what they installed (off in tests).
+    pub dev_tools: bool,
     /// The distro family from `/etc/os-release` (`ID` and `ID_LIKE`), which decides between
     /// package databases when more than one is present.
     pub os_like: Vec<String>,
@@ -62,6 +66,8 @@ impl Env {
                 "/var/lib/flatpak/exports/share".into(),
             ],
             cache_dir: Some(cache.join("depot")),
+            cargo_home: Some(cargo::home_dir(&home)),
+            dev_tools: true,
             os_like: std::fs::read_to_string("/etc/os-release").map(|t| parse_os_like(&t)).unwrap_or_default(),
             home,
         }
@@ -155,10 +161,57 @@ pub struct Inventory {
     pub unused_runtimes: Vec<usize>,
 }
 
+/// What one source of installed software gave: its packages and, for Flatpak, what keeps its
+/// runtimes installed.
+type Loaded = Result<(Vec<Package>, Option<flatpak::Usage>), String>;
+
+/// A source of installed software, read on its own thread.
+struct Source<'a> {
+    /// Names it in warnings.
+    label: &'static str,
+    /// The sandboxed kind it lists. A launcher of that kind that matches nothing it listed is a
+    /// leftover only if it was read.
+    sandbox: Option<Kind>,
+    load: Box<dyn Fn() -> Loaded + Send + Sync + 'a>,
+}
+
+/// Every source this computer has: the system's own packages, Snaps, Flatpaks, then developer
+/// tools.
+fn sources(env: &Env, native: Option<Native>) -> Vec<Source<'_>> {
+    let mut v = vec![Source {
+        label: native.map_or("System packages", Native::label),
+        sandbox: None,
+        load: Box::new(move || Ok((native.map_or(Ok(Vec::new()), |n| n.load(env))?, None))),
+    }];
+    if let Some(socket) = env.snap_socket.as_deref() {
+        v.push(Source {
+            label: "Snaps",
+            sandbox: Some(Kind::Snap),
+            load: Box::new(|| Ok((snap::load(socket)?, None))),
+        });
+    }
+    if env.flatpak {
+        v.push(Source { label: "Flatpaks", sandbox: Some(Kind::Flatpak), load: Box::new(flatpak::load) });
+    }
+    if let Some(dir) = env.cargo_home.as_deref() {
+        v.push(Source { label: "Cargo programs", sandbox: None, load: Box::new(|| Ok((cargo::load(dir)?, None))) });
+    }
+    if env.dev_tools {
+        let home = env.home.as_path();
+        v.extend([
+            Source { label: "npm packages", sandbox: None, load: Box::new(|| Ok((npm::load(home, &env.path)?, None))) },
+            Source { label: "pipx apps", sandbox: None, load: Box::new(|| Ok((pipx::load()?, None))) },
+            Source { label: "Homebrew", sandbox: None, load: Box::new(|| Ok((brew::load()?, None))) },
+            Source { label: "Nix profile", sandbox: None, load: Box::new(|| Ok((nix::load()?, None))) },
+        ]);
+    }
+    v
+}
+
 /// How a launcher was matched to its package.
 enum Claim {
-    Snap(String),
-    Flatpak(String),
+    /// Exported by a sandboxed package (Snap or Flatpak) with this name.
+    Pkg(Kind, String),
     /// Paths to look up in the package database, strongest evidence first.
     /// The flag marks paths that come from the launcher's command rather than the launcher file itself.
     /// The last flag is set when the launcher's program doesn't exist.
@@ -173,11 +226,11 @@ fn web_app(argv: &[String]) -> bool {
 fn claim(l: &Launcher, env: &Env) -> Claim {
     let path = &l.entry.path;
     if path.starts_with(&env.snap_desktop_dir) {
-        let id = l.entry.id.strip_suffix(".desktop").unwrap_or(&l.entry.id);
-        return Claim::Snap(id.split('_').next().unwrap_or(id).to_string());
+        let id = l.entry.base_id();
+        return Claim::Pkg(Kind::Snap, id.split('_').next().unwrap_or(id).to_string());
     }
     if flatpak::is_export(path) {
-        return Claim::Flatpak(l.entry.id.strip_suffix(".desktop").unwrap_or(&l.entry.id).to_string());
+        return Claim::Pkg(Kind::Flatpak, l.entry.base_id().to_string());
     }
     let argv = l.entry.argv();
     let target = exec::target(&argv, &env.path);
@@ -192,8 +245,8 @@ fn claim(l: &Launcher, env: &Env) -> Claim {
         std::iter::once(path).chain(&l.shadowed).map(|p| (p.clone(), false)).collect();
     let mut program = None;
     match target {
-        Some(Target::Snap(s)) => return Claim::Snap(s),
-        Some(Target::Flatpak(f)) => return Claim::Flatpak(f),
+        Some(Target::Snap(s)) => return Claim::Pkg(Kind::Snap, s),
+        Some(Target::Flatpak(f)) => return Claim::Pkg(Kind::Flatpak, f),
         Some(Target::Program { path, generic, script }) => {
             if let (Some(p), false) = (&path, generic) {
                 files.extend(exec::path_variants(p).into_iter().map(|v| (v, true)));
@@ -255,7 +308,7 @@ fn manual_package(
     broken: bool,
 ) -> Package {
     let e = &l.entry;
-    let base = e.id.strip_suffix(".desktop").unwrap_or(&e.id);
+    let base = e.base_id();
     let mut p = Package::new(Kind::Manual, base);
     p.role = Role::App;
     p.user_installed = true;
@@ -298,38 +351,60 @@ fn manual_package(
 /// Read everything installed. Sources are read in parallel; one failing source only adds a warning.
 pub fn scan(env: &Env) -> Inventory {
     let native = Native::detect(env);
-    let (natives, snaps, flats, flat_usage, launchers) = std::thread::scope(|s| {
-        let d = s.spawn(|| native.map_or(Ok(Vec::new()), |n| n.load(env)));
-        let sn = s.spawn(|| env.snap_socket.as_deref().map_or(Ok(Vec::new()), snap::load));
-        let f = s.spawn(|| if env.flatpak { flatpak::load() } else { Ok(Vec::new()) });
-        let fu = s.spawn(|| if env.flatpak { flatpak::usage() } else { None });
-        let l = xdg::collect(&env.app_dirs);
-        let join = |h: std::thread::ScopedJoinHandle<'_, Result<Vec<Package>, String>>| {
-            h.join().unwrap_or_else(|_| Err("A loader crashed.".into()))
-        };
-        (join(d), join(sn), join(f), fu.join().ok().flatten(), l)
+    let sources = sources(env, native);
+    // the launchers and which package files own them are worked out while the sources are read
+    let (loaded, launchers, shown, claims, owners) = std::thread::scope(|s| {
+        let reading: Vec<_> = sources.iter().map(|src| s.spawn(|| (src.load)())).collect();
+        let launchers = xdg::collect(&env.app_dirs);
+        // like the app menu, skip launchers whose TryExec program isn't installed
+        let shown: Vec<usize> = (0..launchers.len())
+            .filter(|&i| {
+                let e = &launchers[i].entry;
+                e.id != SELF_ID
+                    && e.shown(&env.desktops)
+                    && (e.try_exec.is_empty() || exec::resolve(&e.try_exec, &env.path).is_some())
+            })
+            .collect();
+        let claims: Vec<Claim> = shown.iter().map(|&i| claim(&launchers[i], env)).collect();
+        let owners = native.map(|n| {
+            let wanted: HashSet<PathBuf> = claims
+                .iter()
+                .filter_map(
+                    |c| if let Claim::Files(f, _, _) = c { Some(f.iter().map(|(p, _)| p.clone())) } else { None },
+                )
+                .flatten()
+                .collect();
+            (n, n.owners(env, &wanted))
+        });
+        let loaded: Vec<Loaded> =
+            reading.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("A loader crashed.".into()))).collect();
+        (loaded, launchers, shown, claims, owners)
     });
+    let shown: Vec<&Launcher> = shown.into_iter().map(|i| &launchers[i]).collect();
 
     let mut inv = Inventory { system_packages: native.is_some(), ..Default::default() };
-    let mut take = |r: Result<Vec<Package>, String>, what: &str| match r {
-        Ok(v) => v,
-        Err(e) => {
-            inv.warnings.push(format!("{what}: {e}"));
-            Vec::new()
+    // a launcher whose Snap or Flatpak isn't listed is only a leftover if that list was really
+    // read; otherwise it may be a working app, and offering it for deletion would be wrong
+    let mut read: HashSet<Kind> = HashSet::new();
+    let mut flat_usage = None;
+    let mut pkgs: Vec<Package> = Vec::new();
+    for (src, r) in sources.iter().zip(loaded) {
+        match r {
+            Ok((p, usage)) => {
+                read.extend(src.sandbox);
+                pkgs.extend(p);
+                flat_usage = flat_usage.or(usage);
+            }
+            Err(e) => inv.warnings.push(format!("{}: {e}", src.label)),
         }
-    };
-    let natives = take(natives, native.map_or("System packages", Native::label));
-    let snaps = take(snaps, "Snaps");
-    let flats = take(flats, "Flatpaks");
+    }
 
-    let mut pkgs: Vec<Package> = Vec::with_capacity(natives.len() + snaps.len() + flats.len() + 16);
     // native packages by the name their database's file owners use: the id for dpkg, the
     // package name for rpm and pacman (preferring the native-architecture copy)
     let mut native_ix: HashMap<String, usize> = HashMap::new();
-    let mut snap_ix: HashMap<String, usize> = HashMap::new();
-    let mut flat_ix: HashMap<String, usize> = HashMap::new();
-    for p in natives.into_iter().chain(snaps).chain(flats) {
-        let i = pkgs.len();
+    // sandboxed packages by name
+    let mut by_name: HashMap<Kind, HashMap<String, usize>> = HashMap::new();
+    for (i, p) in pkgs.iter().enumerate() {
         match p.kind {
             Kind::Deb => {
                 native_ix.insert(p.id.clone(), i);
@@ -340,50 +415,38 @@ pub fn scan(env: &Env) -> Inventory {
                 }
             }
             Kind::Snap => {
-                snap_ix.insert(p.name.clone(), i);
+                by_name.entry(Kind::Snap).or_default().insert(p.name.clone(), i);
             }
             Kind::Flatpak => {
                 // prefer an app over a same-named runtime, and the default branch over others
                 let rank = |q: &Package| (q.role != Role::Runtime, q.current);
-                if flat_ix.get(&p.name).is_none_or(|&j| rank(&p) > rank(&pkgs[j])) {
-                    flat_ix.insert(p.name.clone(), i);
+                let ix = by_name.entry(Kind::Flatpak).or_default();
+                if ix.get(&p.name).is_none_or(|&j| rank(p) > rank(&pkgs[j])) {
+                    ix.insert(p.name.clone(), i);
                 }
             }
             Kind::AppImage | Kind::Manual => {}
+            // matched to launchers by the files they own, further down
+            Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => {}
         }
-        pkgs.push(p);
     }
 
-    // like the app menu, skip launchers whose TryExec program isn't installed
-    let shown: Vec<&Launcher> = launchers
-        .iter()
-        .filter(|l| l.entry.id != SELF_ID && l.entry.shown(&env.desktops))
-        .filter(|l| l.entry.try_exec.is_empty() || exec::resolve(&l.entry.try_exec, &env.path).is_some())
-        .collect();
     let mut icon_users: HashMap<String, usize> = HashMap::new();
     for l in &launchers {
         if !l.entry.icon.is_empty() {
             *icon_users.entry(l.entry.icon.clone()).or_default() += 1;
         }
     }
-    let claims: Vec<Claim> = shown.iter().map(|l| claim(l, env)).collect();
-
-    let owners = if let Some(native) = native {
-        let wanted: HashSet<PathBuf> = claims
-            .iter()
-            .filter_map(|c| if let Claim::Files(f, _, _) = c { Some(f.iter().map(|(p, _)| p.clone())) } else { None })
-            .flatten()
-            .collect();
-        let (owners, error) = native.owners(env, &wanted);
-        if let Some(e) = error {
+    let owners = match owners {
+        Some((native, (owners, Some(e)))) => {
             inv.warnings.push(format!(
                 "{}: couldn't tell which apps came from them ({e}). They may show up as manual installs; press Refresh to try again.",
                 native.label()
             ));
+            owners
         }
-        owners
-    } else {
-        HashMap::new()
+        Some((_, (owners, None))) => owners,
+        None => HashMap::new(),
     };
 
     // Launchers owned outright come first, so a package's own launcher is its main one and
@@ -391,21 +454,25 @@ pub fn scan(env: &Env) -> Inventory {
     let mut deferred = Vec::new();
     for (l, c) in shown.iter().zip(&claims) {
         match c {
-            Claim::Snap(name) => match snap_ix.get(name) {
-                Some(&i) => {
-                    if pkgs[i].role != Role::Runtime {
-                        attach(&mut pkgs[i], l)
-                    }
-                }
-                None => deferred.push((*l, None, false, true)),
-            },
-            Claim::Flatpak(id) => {
-                let hit = flat_ix.get(id).or_else(|| {
-                    flat_ix.iter().filter(|(k, _)| flatpak_child(id, k)).max_by_key(|(k, _)| k.len()).map(|(_, i)| i)
+            Claim::Pkg(kind, name) => {
+                let ix = by_name.get(kind);
+                let hit = ix.and_then(|ix| {
+                    ix.get(name).or_else(|| match kind {
+                        // an extra launcher of a Flatpak app is named after it (`org.x.App.Tool`)
+                        Kind::Flatpak => ix
+                            .iter()
+                            .filter(|(k, _)| flatpak_child(name, k))
+                            .max_by_key(|(k, _)| k.len())
+                            .map(|(_, i)| i),
+                        _ => None,
+                    })
                 });
                 match hit {
+                    // a Snap runtime's launchers aren't an app of its own
+                    Some(&i) if *kind == Kind::Snap && pkgs[i].role == Role::Runtime => {}
                     Some(&i) => attach(&mut pkgs[i], l),
-                    None => deferred.push((*l, None, false, true)),
+                    None if read.contains(kind) => deferred.push((*l, None, false, true)),
+                    None => {}
                 }
             }
             Claim::WebApp(missing) => deferred.push((*l, None, true, *missing)),
@@ -425,11 +492,31 @@ pub fn scan(env: &Env) -> Inventory {
         .filter(|p| p.starts_with(&env.home))
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
         .collect();
+    // developer tools' own files and folders, longest first so the closest one wins
+    let mut dev_roots: Vec<(PathBuf, usize)> = pkgs
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind.is_dev_tool())
+        .flat_map(|(i, p)| p.paths.iter().map(move |r| (std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()), i)))
+        .collect();
+    dev_roots.sort_by_key(|(r, _)| std::cmp::Reverse(r.as_os_str().len()));
+    let dev_owner = |paths: &[&Path]| {
+        paths
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .find_map(|p| dev_roots.iter().find(|(r, _)| p.starts_with(r)).map(|&(_, i)| i))
+    };
     let mut appimages = HashSet::new();
     for (l, files, web, broken) in deferred {
         if let Some((files, program)) = files {
             let by_exec = files.iter().find_map(|(p, _)| owners.get(p)).and_then(|o| native_ix.get(o));
             if let Some(&i) = by_exec {
+                attach(&mut pkgs[i], l);
+                continue;
+            }
+            // started from a developer tool's folder (`~/.cargo/bin/x`), or the launcher came with it (Nix)
+            let candidates: Vec<&Path> = program.into_iter().chain([l.entry.path.as_path()]).collect();
+            if let Some(i) = dev_owner(&candidates) {
                 attach(&mut pkgs[i], l);
                 continue;
             }
@@ -451,7 +538,8 @@ pub fn scan(env: &Env) -> Inventory {
             p.icon = match p.kind {
                 Kind::Snap => snap::bundled_icon(&p.name),
                 Kind::Flatpak => flatpak::icon(&env.flatpak_share, &p.name),
-                _ => None,
+                Kind::Deb | Kind::Rpm | Kind::Pacman | Kind::AppImage | Kind::Manual => None,
+                Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => None,
             };
         } else if p.kind == Kind::Flatpak && p.icon.as_deref() == Some(p.name.as_str()) {
             // exported icons may not be on the icon theme path; prefer the file

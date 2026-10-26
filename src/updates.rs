@@ -1,9 +1,9 @@
 //! Checking for and installing updates from every source at once.
 
 use crate::packagekit;
-use crate::system::Outcome;
+use crate::system::{Outcome, plural};
 use crate::ui::operation::{self, Operation};
-use depot_core::backend::{flatpak, snap};
+use depot_core::backend::{brew, cargo, flatpak, npm, snap};
 use depot_core::{Kind, Package, Update, updates};
 use gtk::gio;
 use serde::Serialize;
@@ -33,13 +33,34 @@ pub async fn check(refresh: bool, inv: &[Package]) -> Checked {
         }
         packagekit::get_updates().await
     };
-    let (native, snaps, flat_sys, flat_user) = futures_util::future::join4(native, snaps, flat_sys, flat_user).await;
+    // developer tools are only asked when something of theirs is installed
+    let has = |k: Kind| inv.iter().any(|p| p.kind == k && p.blocked.is_none());
+    let npm = has(Kind::Npm).then(|| gio::spawn_blocking(npm::outdated));
+    let brew = has(Kind::Brew).then(|| gio::spawn_blocking(brew::outdated));
+    let crates: Vec<(String, String)> =
+        inv.iter().filter(|p| p.kind == Kind::Cargo).map(|p| (p.id.clone(), p.version.clone())).collect();
+    let cargo = (!crates.is_empty())
+        .then(|| gio::spawn_blocking(move || cargo::outdated(&cargo::home_dir(&crate::system::home()), &crates)));
+    let tools = futures_util::future::join_all(
+        [(Kind::Npm, "npm", npm), (Kind::Brew, "Homebrew", brew), (Kind::Cargo, "Cargo", cargo)]
+            .into_iter()
+            .filter_map(|(k, label, h)| h.map(|h| async move { (k, label, h.await) })),
+    );
+    let ((native, snaps, flat_sys, flat_user), tools) =
+        futures_util::future::join(futures_util::future::join4(native, snaps, flat_sys, flat_user), tools).await;
 
     let mut out = Checked::default();
     match native {
         Ok(pk) => {
             let pk: Vec<(u32, String)> = pk.into_iter().map(|p| (p.info, p.id)).collect();
-            out.updates.extend(updates::from_packagekit(&pk, inv));
+            let found = updates::from_packagekit(&pk, inv);
+            if found.is_empty() && !pk.is_empty() {
+                out.warnings.push(
+                    "System packages: Depot couldn't read your installed packages, so their updates can't be shown."
+                        .into(),
+                );
+            }
+            out.updates.extend(found);
         }
         Err(e) => out.warnings.push(format!("System packages: {e}")),
     }
@@ -51,6 +72,12 @@ pub async fn check(refresh: bool, inv: &[Package]) -> Checked {
         match f.unwrap_or_else(|_| Err("crashed".into())) {
             Ok(f) => out.updates.extend(updates::from_flatpaks(&f, inv)),
             Err(e) => out.warnings.push(format!("Flatpaks: {e}")),
+        }
+    }
+    for (kind, label, r) in tools {
+        match r.unwrap_or_else(|_| Err("crashed".into())) {
+            Ok(found) => out.updates.extend(updates::from_tool(kind, &found, inv)),
+            Err(e) => out.warnings.push(format!("{label}: {e}")),
         }
     }
     out.updates.sort_by_cached_key(|u| u.title.to_lowercase());
@@ -78,27 +105,40 @@ pub struct Batch {
 enum What {
     Native(Vec<String>),
     Snaps(Vec<String>),
-    Flatpaks { system: bool, refs: Vec<String> },
-}
-
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
+    Flatpaks {
+        system: bool,
+        refs: Vec<String>,
+    },
+    /// The whole command, from a developer tool.
+    Tool(Vec<String>),
 }
 
 /// Split `list` into the batches that install it.
 pub fn batches(list: &[Update]) -> Vec<Batch> {
+    // every kind is sorted here, so a new kind can't be quietly left out
+    let (mut natives, mut snaps, mut flats_system, mut flats_user) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut crates, mut npms, mut brews) = (Vec::new(), Vec::new(), Vec::new());
+    for u in list {
+        match u.kind {
+            Kind::Deb | Kind::Rpm | Kind::Pacman => natives.push(u.id.clone()),
+            Kind::Snap => snaps.push(u.id.clone()),
+            Kind::Flatpak if u.system => flats_system.push(u.id.clone()),
+            Kind::Flatpak => flats_user.push(u.id.clone()),
+            Kind::Cargo => crates.push(u.id.clone()),
+            Kind::Npm => npms.push(format!("{}@latest", u.id)),
+            Kind::Brew => brews.push(u.id.clone()),
+            // nothing tells Depot about newer versions of these, so there are no updates to install
+            Kind::AppImage | Kind::Manual | Kind::Pipx | Kind::Nix => {}
+        }
+    }
     let mut out = Vec::new();
-    let natives: Vec<String> = list.iter().filter(|u| u.kind.is_native()).map(|u| u.id.clone()).collect();
     if !natives.is_empty() {
         out.push(Batch { title: format!("System packages ({})", natives.len()), what: What::Native(natives) });
     }
-    let snaps: Vec<String> = list.iter().filter(|u| u.kind == Kind::Snap).map(|u| u.id.clone()).collect();
     if !snaps.is_empty() {
         out.push(Batch { title: format!("Snaps ({})", snaps.len()), what: What::Snaps(snaps) });
     }
-    for system in [true, false] {
-        let refs: Vec<String> =
-            list.iter().filter(|u| u.kind == Kind::Flatpak && u.system == system).map(|u| u.id.clone()).collect();
+    for (system, refs) in [(true, flats_system), (false, flats_user)] {
         if !refs.is_empty() {
             let whose = if system { "for everyone" } else { "for you" };
             out.push(Batch {
@@ -106,6 +146,23 @@ pub fn batches(list: &[Update]) -> Vec<Batch> {
                 what: What::Flatpaks { system, refs },
             });
         }
+    }
+    // cargo builds each program again from source, one at a time
+    let cargo_home = cargo::home_dir(&crate::system::home());
+    for name in crates {
+        out.push(Batch { title: name.clone(), what: What::Tool(cargo::reinstall_args(&cargo_home, &name)) });
+    }
+    let tool = |title: &str, base: &[&str], ids: Vec<String>| {
+        let mut cmd: Vec<String> = base.iter().map(|a| a.to_string()).collect();
+        let n = ids.len();
+        cmd.extend(ids);
+        Batch { title: format!("{title} ({n})"), what: What::Tool(cmd) }
+    };
+    if !npms.is_empty() {
+        out.push(tool("npm packages", &["npm", "install", "-g", "--"], npms));
+    }
+    if !brews.is_empty() {
+        out.push(tool("Homebrew packages", &["brew", "upgrade", "--"], brews));
     }
     out
 }
@@ -136,10 +193,10 @@ pub async fn apply(b: &Batch, op: &Rc<Operation>) -> Outcome {
                     .to_vec();
             cmd.extend(refs.iter().cloned());
             let what = plural(refs.len(), "Flatpak item", "Flatpak items");
-            let r = operation::command(op, &cmd, false, &format!("Updating {what}…")).await;
-            op.set_hint("");
-            r
+            operation::command(op, &cmd, false, &format!("Updating {what}…")).await
         }
+        // developer tools install for you alone, so no password
+        What::Tool(cmd) => operation::command(op, cmd, false, &format!("Updating {}…", b.title)).await,
     }
 }
 
@@ -150,7 +207,32 @@ impl Batch {
     }
 }
 
-/// A hint shown while a batch runs that may ask for a password by itself.
-pub fn may_ask(b: &Batch) -> bool {
-    matches!(b.what, What::Flatpaks { system: true, .. })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn up(kind: Kind, id: &str) -> Update {
+        Update {
+            kind,
+            id: id.into(),
+            name: id.into(),
+            title: id.into(),
+            from: String::new(),
+            to: String::new(),
+            icon: None,
+            role: depot_core::Role::Tool,
+            security: false,
+            system: false,
+        }
+    }
+
+    #[test]
+    fn tool_updates_get_their_own_batches() {
+        let b =
+            batches(&[up(Kind::Npm, "typescript"), up(Kind::Npm, "eslint"), up(Kind::Brew, "gh"), up(Kind::Pipx, "x")]);
+        let cmds: Vec<String> =
+            b.iter().map(|b| if let What::Tool(c) = &b.what { c.join(" ") } else { String::new() }).collect();
+        assert_eq!(cmds, ["npm install -g -- typescript@latest eslint@latest", "brew upgrade -- gh"]);
+        assert_eq!(b[0].title, "npm packages (2)");
+    }
 }
