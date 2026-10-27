@@ -3,11 +3,11 @@ members = ["crates/depot-core"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/kimzam30/Nhako-Depot"
-authors = ["Kim <hakimgame30@gmail.com>"]
+authors = ["kimzam30 <hakimgame30@gmail.com>"]
 
 [package]
 name = "depot"
@@ -33,3 +33,54 @@ lto = "fat"
 codegen-units = 1
 # no panic = "abort": a crashing source loader must become a warning, not close the app
 strip = true
+
+# `cargo deb` builds the .deb for Ubuntu, Debian, Zorin OS and Linux Mint
+[package.metadata.deb]
+name = "depot"
+maintainer = "kimzam30 <hakimgame30@gmail.com>"
+copyright = "2026 kimzam30"
+license-file = ["LICENSE", "0"]
+section = "admin"
+priority = "optional"
+extended-description = """\
+Linux software comes from many places: your distribution's own packages, Snap, Flatpak, \
+AppImages, downloaded archives and developer tools. Depot puts all of it in one window, says in \
+plain language how each app was installed, and updates or removes it the right way."""
+# $auto adds the GTK 4, libadwaita and glibc versions the program was built against;
+# pkexec asks for the password, gio opens apps
+depends = "$auto, pkexec | policykit-1, libglib2.0-bin"
+recommends = "packagekit"
+assets = [
+    ["target/release/depot", "usr/bin/", "755"],
+    ["data/dev.kimzam.Depot.desktop", "usr/share/applications/", "644"],
+    ["data/icons/hicolor/scalable/apps/dev.kimzam.Depot.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["data/dev.kimzam.Depot.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["README.md", "usr/share/doc/depot/", "644"],
+    ["NOTICE.md", "usr/share/doc/depot/", "644"],
+]
+
+# `cargo generate-rpm` builds the .rpm for Fedora
+[package.metadata.generate-rpm]
+name = "depot"
+summary = "See, update and remove every app on your computer"
+license = "GPL-3.0-or-later"
+url = "https://github.com/kimzam30/Nhako-Depot"
+assets = [
+    { source = "target/release/depot", dest = "/usr/bin/depot", mode = "755" },
+    { source = "data/dev.kimzam.Depot.desktop", dest = "/usr/share/applications/dev.kimzam.Depot.desktop", mode = "644" },
+    { source = "data/icons/hicolor/scalable/apps/dev.kimzam.Depot.svg", dest = "/usr/share/icons/hicolor/scalable/apps/dev.kimzam.Depot.svg", mode = "644" },
+    { source = "data/dev.kimzam.Depot.metainfo.xml", dest = "/usr/share/metainfo/dev.kimzam.Depot.metainfo.xml", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/depot/LICENSE", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/depot/README.md", mode = "644", doc = true },
+]
+auto-req = "no"
+
+[package.metadata.generate-rpm.requires]
+gtk4 = ">= 4.14"
+libadwaita = ">= 1.5"
+polkit = "*"
+glib2 = "*"
+glibc = ">= 2.39"
+
+[package.metadata.generate-rpm.recommends]
+PackageKit = "*"

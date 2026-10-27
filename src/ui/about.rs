@@ -10,6 +10,9 @@ use std::rc::Rc;
 
 const REPO: &str = "https://github.com/kimzam30/Nhako-Depot";
 
+/// The AppStream metadata, whose newest release notes are also the About window's "What's New".
+const METAINFO: &str = include_str!("../../data/dev.kimzam.Depot.metainfo.xml");
+
 const PRIVACY: &str = "Depot has no accounts, no ads and no tracking, and it never sends anything about you \
 or your computer anywhere.\n\nTo check for updates, it asks the software sources your computer already uses \
 (through PackageKit, Snap and Flatpak), the same way the Software app does. Everything else Depot shows is \
@@ -35,7 +38,7 @@ const SHORTCUTS: &str = r#"<interface>
           <object class="GtkShortcutsGroup">
             <property name="title">General</property>
             <child><object class="GtkShortcutsShortcut"><property name="title">Search</property><property name="accelerator">&lt;Control&gt;f</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="title">Refresh</property><property name="accelerator">F5</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Refresh</property><property name="accelerator">F5 &lt;Control&gt;r</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Go back</property><property name="accelerator">Escape</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Keyboard shortcuts</property><property name="accelerator">&lt;Control&gt;question</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Quit</property><property name="accelerator">&lt;Control&gt;q</property></object></child>
@@ -150,39 +153,45 @@ fn debug_info(st: &State) -> String {
     )
 }
 
+/// The newest release's version and notes from the metadata, so the About window and software
+/// centres say the same thing.
+fn latest_release() -> Option<(&'static str, String)> {
+    let releases = &METAINFO[METAINFO.find("<releases>")?..];
+    let newest = &releases[releases.find("<release ")?..];
+    let version = newest.split_once("version=\"")?.1.split('"').next()?;
+    let notes = newest.split_once("<description>")?.1.split_once("</description>")?.0;
+    Some((version, notes.split_whitespace().collect::<Vec<_>>().join(" ")))
+}
+
 fn about(st: &Rc<State>) {
+    let (version, notes) = latest_release().unwrap_or((env!("CARGO_PKG_VERSION"), String::new()));
     let d = adw::AboutDialog::builder()
         .application_icon(crate::APP_ID)
         .application_name("Depot")
-        .developer_name("Kim")
+        .developer_name("kimzam30")
         .version(env!("CARGO_PKG_VERSION"))
         .comments("See every app on your Linux computer in one place. Keep them up to date, and remove the ones you don't need.")
         .website(REPO)
         .issue_url(format!("{REPO}/issues"))
         .support_url(format!("{REPO}/blob/main/docs/GUIDE.md"))
-        .copyright("© 2026 Kim")
+        .copyright("© 2026 kimzam30")
         .license_type(gtk::License::Gpl30)
-        .developers(["Kim https://github.com/kimzam30"])
-        .artists(["Kim (the penguin mascot)"])
+        .developers(["kimzam30 https://github.com/kimzam30"])
+        .artists(["kimzam30 (the penguin mascot)"])
         .debug_info(debug_info(st))
         .debug_info_filename("depot-debug-info.txt")
-        .release_notes_version(env!("CARGO_PKG_VERSION"))
-        .release_notes(
-            "<p>This version makes every step easy to follow:</p>\
-             <ul>\
-             <li>Select several apps and uninstall them together</li>\
-             <li>Tick exactly which updates to install</li>\
-             <li>A progress window that says when your password was accepted and how it all went</li>\
-             <li>Safer clean-up of apps installed by hand</li>\
-             </ul>",
-        )
+        .release_notes_version(version)
+        .release_notes(&notes)
         .build();
-    d.add_legal_section("No warranty", Some("© 2026 Kim"), gtk::License::Gpl30, Some(WARRANTY));
+    // AdwAboutDialog asks for 360 px, and a dialog keeps 30 px of window on each side: on a
+    // 360 px phone that pushed its right edge off the screen
+    d.set_width_request(300);
+    d.add_legal_section("No warranty", Some("© 2026 kimzam30"), gtk::License::Gpl30, Some(WARRANTY));
     d.add_legal_section("Privacy", None, gtk::License::Custom, Some(PRIVACY));
     d.add_legal_section("Trademarks", None, gtk::License::Custom, Some(TRADEMARKS));
     d.add_legal_section(
         "Artwork",
-        Some("© 2026 Kim"),
+        Some("© 2026 kimzam30"),
         gtk::License::Custom,
         Some("The penguin mascot and the app icon were made for Depot and are shared under the same licence as the program (GPL-3.0-or-later)."),
     );
@@ -202,4 +211,16 @@ fn about(st: &Rc<State>) {
         Some("Depot's window is drawn with GTK and libadwaita, which are shared under the GNU Lesser General Public License, version 2.1 or later."),
     );
     d.present(Some(&st.win));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_notes_come_from_the_metadata_for_this_version() {
+        let (version, notes) = latest_release().unwrap();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"), "add this version to the metainfo's <releases>");
+        assert!(notes.starts_with("<ul>") && notes.ends_with("</ul>"), "{notes}");
+    }
 }

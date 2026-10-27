@@ -556,7 +556,8 @@ pub fn activate(app: &adw::Application) {
     about::install(&st);
     #[cfg(debug_assertions)]
     if let Some(dir) = std::env::var_os("DEPOT_TOUR") {
-        win.set_default_size(tour::WIDTH, tour::HEIGHT);
+        let (w, h) = tour::size();
+        win.set_default_size(w, h);
         // Broadway reports no text DPI, which stops breakpoints in `sp` from ever matching
         if let Some(s) = gtk::Settings::default() {
             if s.gtk_xft_dpi() <= 0 {

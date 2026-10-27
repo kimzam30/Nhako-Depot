@@ -12,18 +12,21 @@ installed, and updates or removes it the right way, so you don't need to know wh
 
 Depot is made for people who are new to Linux, and it's fast: once it has run once, reading about
 2,500 packages takes under 100 ms (the very first scan can take a few seconds), from a single native
-program of about 1 MB.
+program of about 2 MB.
 
 ## What it does
 
 - **Shows everything installed** as **Deb** (apt), **RPM** (dnf), **Pacman** (including AUR builds),
   **Snap**, **Flatpak**, **AppImage** or **Manual** (installed by hand), each with a badge that explains what it means.
+  Programs from the developer tools **cargo**, **npm**, **pipx**, **Homebrew** and **Nix** are listed
+  under **Advanced**, and removed with each tool's own uninstall command.
 - **Gets the source right.** Each app appears once, under the package it really came from, even
   when an install script copied its launcher into place. An app installed more than one way (say
   as a Deb and a Flatpak) gets one card that shows every copy, so you can keep just one.
 - **Updates.** Lists newer versions of your apps with their old and new version numbers. Every
   update has a tick box, all ticked to start with: untick what you want to skip and install the
   rest in one go. Libraries, drivers and runtimes are grouped into a single "System updates" entry.
+  Programs from cargo, npm and Homebrew get their updates there too.
 - **Removes several apps at once.** Press **Select**, tick the apps you don't need, and uninstall
   them together, usually with one password prompt.
 - **Removes apps safely.** Before anything is removed, Depot shows exactly what will go with it.
@@ -38,6 +41,8 @@ program of about 1 MB.
   that needed them are gone. **Advanced → Runtimes & bases** says how many no app uses any more and
   how much space they take, and **Clean up** removes them. Runtimes you installed on purpose
   (pinned) are left alone.
+- **Works on small screens and with a screen reader.** Every screen fits a 360 px wide phone
+  screen, and buttons, tick boxes and progress are named and announced for screen readers such as Orca.
 - **Keeps the clutter out of the way.** Libraries, command-line tools and runtimes live under
   **Advanced**, so the main view shows only your apps.
 
@@ -49,8 +54,34 @@ Depot needs GTK 4.14 or newer and libadwaita 1.5 or newer: Ubuntu 24.04, Zorin O
 Debian 13, Fedora 40, Arch Linux, or anything newer. Debian-based systems are the most tested; Fedora
 and Arch support is new, so please [report](docs/GUIDE.md#reporting-a-problem) anything that looks
 wrong there. On Fedora, updating and removing system packages goes through PackageKit, which Fedora
-includes. There are no ready-made downloads yet, so you build it once from source. It takes about
-five minutes.
+includes.
+
+### Download it (Ubuntu, Zorin OS, Linux Mint, Debian, Fedora)
+
+Open the [latest release](https://github.com/kimzam30/Nhako-Depot/releases/latest) and download
+the file for your system:
+
+- **`.deb`** for Ubuntu 24.04, Zorin OS 18, Linux Mint 22, Debian 13 or newer
+- **`.rpm`** for Fedora 40 or newer
+
+Double-click the file to install it with your Software app, or install it from a terminal in your
+Downloads folder:
+
+```sh
+sudo apt install ./depot_*_amd64.deb   # Ubuntu, Zorin OS, Linux Mint, Debian
+sudo dnf install ./depot-*.x86_64.rpm   # Fedora
+```
+
+Then open Depot from your app menu. Updates to Depot itself come as a new download on the releases
+page. To remove it, uninstall **Depot** from your Software app, or run `sudo apt remove depot` /
+`sudo dnf remove depot`.
+
+If you installed Depot from source before, run `./install.sh --uninstall` in that folder first,
+so your app menu doesn't show two copies.
+
+### Build it from source (Arch Linux, or anything else)
+
+This takes about five minutes.
 
 **1. Install the build tools** (asks for your password):
 
@@ -103,9 +134,11 @@ from your app menu by searching for **Depot**.
 - [x] AppImage (found with or without a launcher, removed to the Trash)
 - [x] Clean up unused Flatpak runtimes on their own, not only after an uninstall
 - [x] Screen-reader names for icon buttons, app cards and the sidebar; progress and results are announced
-- [ ] Check every screen on a real phone-sized screen and with the Orca screen reader
-- [ ] Developer tools: pipx, cargo, npm, Homebrew, Nix
-- [ ] `.deb` and `.rpm` downloads on GitHub Releases
+- [x] Every screen fits a 360 px wide phone screen
+- [ ] Every screen checked with the Orca screen reader ([checklist](docs/ORCA-CHECKLIST.md))
+- [x] Developer tools: pipx, cargo, npm, Homebrew, Nix (cargo and npm tested on a real system;
+      pipx, Homebrew and Nix so far only against sample output from those tools)
+- [x] `.deb` and `.rpm` downloads on GitHub Releases
 
 ## For developers
 
@@ -115,9 +148,11 @@ cargo run --release        # run the app
 ```
 
 `depot --help` lists commands that work without opening a window, handy for bug reports:
-`--list-only` prints everything installed as JSON, `--updates` prints available updates, and
+`--list-only` prints everything installed as JSON, `--updates` prints available updates
+(`--updates --refresh` asks the software sources for the latest list first), and
 `--simulate-remove NAME` / `--simulate-update` show what PackageKit would do without changing anything.
-`--unused-runtimes` prints the Flatpak runtimes Depot would offer to clean up.
+`--unused-runtimes` prints the Flatpak runtimes Depot would offer to clean up, and `--version`
+prints the version.
 
 | Path | What's there |
 | --- | --- |
@@ -130,7 +165,7 @@ cargo run --release        # run the app
 | `src/ui/select.rs` | Selection mode: tick several apps and uninstall them together |
 | `src/ui/about.rs` | Main menu, keyboard shortcuts, privacy, and the About window's legal notices |
 | `data/` | Stylesheet, launcher, icon, AppStream metadata, third-party licence list |
-| `docs/` | The beginner's guide, the privacy policy and the logo |
+| `docs/` | The beginner's guide, the privacy policy, the screen-reader checklist, screenshots and the logo |
 | `scripts/third-party.py` | Regenerates `data/third-party.txt` after dependencies change |
 
 Performance comes from reading package databases directly (no `dpkg-query` per package), loading

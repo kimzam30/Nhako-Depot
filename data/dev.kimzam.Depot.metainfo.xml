@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Copyright 2026 Kim -->
+<!-- Copyright 2026 kimzam30 -->
 <component type="desktop-application">
   <id>dev.kimzam.Depot</id>
   <metadata_license>CC0-1.0</metadata_license>
@@ -9,7 +9,7 @@
   <summary>See, update and remove every app on your computer</summary>
 
   <developer id="dev.kimzam">
-    <name>Kim</name>
+    <name>kimzam30</name>
   </developer>
 
   <description>
@@ -22,13 +22,34 @@
     <p>Depot is made for people who are new to Linux:</p>
     <ul>
       <li>Every app in one place, with a badge saying whether it's a Deb, RPM, Pacman, Snap, Flatpak, AppImage or manual install</li>
+      <li>Programs installed with cargo, npm, pipx, Homebrew or Nix, kept out of the way under Advanced</li>
       <li>One card per app, even when it's installed more than one way</li>
       <li>Tick several apps and uninstall them together, or tick exactly which updates to install</li>
       <li>Before anything is removed, Depot shows exactly what will go with it</li>
       <li>Apps installed by hand go to the Trash, so you can change your mind</li>
       <li>Finds broken launchers left behind in your app menu</li>
+      <li>Frees space taken by Flatpak runtimes that no app uses any more</li>
     </ul>
   </description>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Every app on your computer, with a badge saying how it was installed</caption>
+      <image type="source" width="1024" height="720">https://raw.githubusercontent.com/kimzam30/Nhako-Depot/main/docs/screenshots/apps.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>An app's page: what it is, where it came from and how big it is</caption>
+      <image type="source" width="1024" height="720">https://raw.githubusercontent.com/kimzam30/Nhako-Depot/main/docs/screenshots/app-page.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Before anything is removed, Depot shows exactly what will change</caption>
+      <image type="source" width="1024" height="720">https://raw.githubusercontent.com/kimzam30/Nhako-Depot/main/docs/screenshots/uninstall.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Depot fits a phone-sized screen</caption>
+      <image type="source" width="360" height="768">https://raw.githubusercontent.com/kimzam30/Nhako-Depot/main/docs/screenshots/phone.png</image>
+    </screenshot>
+  </screenshots>
 
   <launchable type="desktop-id">dev.kimzam.Depot.desktop</launchable>
   <provides>
@@ -54,6 +75,11 @@
     <keyword>flatpak</keyword>
     <keyword>appimage</keyword>
     <keyword>deb</keyword>
+    <keyword>rpm</keyword>
+    <keyword>pacman</keyword>
+    <keyword>cargo</keyword>
+    <keyword>npm</keyword>
+    <keyword>homebrew</keyword>
   </keywords>
 
   <branding>
@@ -69,10 +95,20 @@
   <supports>
     <control>pointing</control>
     <control>keyboard</control>
-    <control>touch</control>
   </supports>
 
   <releases>
+    <release version="0.4.0" date="2026-10-27">
+      <description>
+        <ul>
+          <li>Programs installed with cargo, npm, pipx, Homebrew or Nix, under Advanced → Developer tools, with updates for cargo, npm and Homebrew</li>
+          <li>AppImages are found, even without a launcher, and removed to the Trash</li>
+          <li>Clean up Flatpak runtimes that no app uses any more</li>
+          <li>Every screen fits a phone-sized screen, and screen readers hear what each button does and how a change is going</li>
+          <li>Safer removal of apps installed by hand, and no more hangs when the update service stops</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-10-24">
       <description>
         <ul>

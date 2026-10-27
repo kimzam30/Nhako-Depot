@@ -1,6 +1,7 @@
 //! A screenshot tour for checking layouts, in debug builds only: `DEPOT_TOUR=<folder> depot`
 //! opens a phone-sized window, visits every screen, saves each as a PNG and writes how wide the
 //! window had to be (`report.txt`). Anything wider than 360 px doesn't fit a phone.
+//! `DEPOT_TOUR_SIZE=1000x700` takes the pictures at another size, such as for the store listing.
 
 use super::operation::{self, Ending, ItemState, Operation};
 use super::{State, detail, item, remove, select};
@@ -13,6 +14,19 @@ use std::time::Duration;
 
 pub const WIDTH: i32 = 360;
 pub const HEIGHT: i32 = 780;
+/// A dialog keeps 30 px of window on each side.
+const DIALOG: i32 = WIDTH - 60;
+
+/// The window size: `DEPOT_TOUR_SIZE` (`WxH`), or a phone's.
+pub fn size() -> (i32, i32) {
+    std::env::var("DEPOT_TOUR_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((WIDTH, HEIGHT))
+}
 
 type Visit = Box<dyn Fn(&Rc<State>)>;
 
@@ -236,8 +250,9 @@ pub fn start(st: &Rc<State>, dir: PathBuf) {
             // the window itself never asks for more than its 360 px minimum; what's inside does
             let min_of = |w: &gtk::Widget| w.measure(gtk::Orientation::Horizontal, -1).0;
             let content = min_of(st.toasts.upcast_ref());
-            let dialog = st.win.visible_dialog().and_then(|d| d.child()).map_or(0, |c| min_of(&c));
-            let min = content.max(dialog);
+            // the dialog itself, not only what we put in it: AdwAboutDialog's own pages count too
+            let dialog =
+                st.win.visible_dialog().map_or(0, |d| min_of(d.upcast_ref()).max(d.child().map_or(0, |c| min_of(&c))));
             fresh_frame(&st.win).await;
             let file = dir.join(format!("{:02}-{name}.png", i + 1));
             // the first frame after a change can come out empty; try again shortly
@@ -250,16 +265,24 @@ pub fn start(st: &Rc<State>, dir: PathBuf) {
                 saved = save(&st.win, &file);
             }
             let saved = saved.err().map(|e| format!(" (not saved: {e})")).unwrap_or_default();
-            let verdict = if min > WIDTH { "TOO WIDE" } else { "fits" };
+            // only a phone-sized tour says whether a screen fits
+            let too_wide = size().0 == WIDTH && (content > WIDTH || dialog > DIALOG);
+            let verdict = if too_wide {
+                "TOO WIDE"
+            } else if size().0 == WIDTH {
+                "fits"
+            } else {
+                "measured"
+            };
             if i == 0 {
                 let bp = st.win.current_breakpoint().and_then(|b| b.condition()).map(|c| c.to_str().to_string());
                 let dpi = gtk::Settings::default().map(|s| s.gtk_xft_dpi()).unwrap_or(0);
                 report.push(format!("breakpoint {bp:?}, xft-dpi {dpi}, window {}x{}", st.win.width(), st.win.height()));
             }
-            if min > WIDTH {
+            if too_wide {
                 let mut why = Vec::new();
-                match st.win.visible_dialog().and_then(|d| d.child()) {
-                    Some(c) if dialog > WIDTH => widest(&c, 0, &mut why),
+                match st.win.visible_dialog() {
+                    Some(d) if dialog > DIALOG => widest(d.upcast_ref(), 0, &mut why),
                     _ => widest(st.toasts.upcast_ref(), 0, &mut why),
                 }
                 let _ = std::fs::write(dir.join(format!("{:02}-{name}.why.txt", i + 1)), why.join("\n") + "\n");

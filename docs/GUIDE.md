@@ -14,7 +14,7 @@ The list on the left is the **sidebar**. The number next to each entry tells you
 
 | Sidebar entry | What you'll find there |
 | --- | --- |
-| **All apps** | Every app that has an icon in your app menu |
+| **All apps** | Every app that has an icon in your app menu, plus AppImages that don't have one |
 | **Updates** | Apps with a newer version waiting (see step 5) |
 | **Deb apps**, **RPM apps** or **Pacman apps** | Apps from your system's own software sources (which one depends on your Linux) |
 | **Snap apps** | Apps from the Snap Store |
@@ -22,9 +22,13 @@ The list on the left is the **sidebar**. The number next to each entry tells you
 | **AppImages** | Apps you downloaded as a single `.AppImage` file, whether or not they're in your app menu |
 | **Manual installs** | Apps you downloaded and installed by hand |
 | **Broken launchers** | Menu entries whose app is already gone (see step 6) |
-| **Advanced** | Click to show libraries, command-line tools and runtimes. You rarely need these. |
+| **Advanced** | Click to show the four entries below. You rarely need these. |
+| **Tools you installed** | Command-line tools you installed from your system's software sources yourself |
+| **Developer tools** | Programs installed with cargo, npm, pipx, Homebrew or Nix (see section 8) |
+| **All system packages** | Every library and tool from your system's software sources |
+| **Runtimes & bases** | The shared building blocks that Flatpaks and Snaps need (see section 7) |
 
-Entries with nothing in them are hidden. If your window is narrow, the sidebar tucks away; click the
+Entries with nothing in them are hidden, except **All apps** and the entry you're looking at. If your window is narrow, the sidebar tucks away; click the
 sidebar button in the top-left corner to show it.
 
 **Searching:** click the search box at the top, or press **Ctrl+F**, and type part of a name. If
@@ -45,6 +49,7 @@ Each card has a badge saying how the app was installed. Hover over a badge for a
 - **AppImage**: an app packed into one downloaded file. Removing it moves the file to the Trash.
 - **Manual**: installed by hand, for example from a downloaded archive or script.
 - **Broken**: the launcher is still in your menu, but its app is gone.
+- **cargo**, **npm**, **pipx**, **Homebrew** or **Nix**: a program installed with that developer tool.
 
 ## 3. Look at an app
 
@@ -81,7 +86,7 @@ computer needs to work, such as the core of the system or the runtimes that Flat
 3. Click **Uninstall**. If your computer asks for your password, type it. That's your system
    checking it's really you, not Depot.
 
-For apps installed by hand, Depot lists the files it found and the confirm button says **Move to
+For AppImages and apps installed by hand, Depot lists the files it found and the confirm button says **Move to
 Trash**. The files go to your Trash, so if you change your mind you can open the Trash and restore
 them. If Depot only found the app's menu entry, the button on its page says **Remove launcher** and
 the program itself is left alone.
@@ -107,7 +112,7 @@ After you press **Uninstall**, a progress window opens and tells you, step by st
 1. Press **Select** at the top, or hold **Ctrl** and click a card. On a
    touchscreen, press and hold a card.
 2. Tick every app you want to remove. Clicking a card now ticks it instead of opening it. **Select
-   all** (or **Ctrl+A**) ticks every app shown, which works well together with search or a
+   all** in the bar at the bottom (or **Ctrl+A**) ticks every app shown, which works well together with search or a
    category. Apps Depot can't remove can't be ticked; it says why.
 3. The bar at the bottom says how many you've ticked and how much space they use. Press
    **Uninstall**.
@@ -125,7 +130,8 @@ few seconds.
 - **Apps** lists each app with its current and new version, for example `1.97.56 → 1.97.57`.
   Click **Update** next to one app to update only that app.
 - **System updates** groups libraries, drivers and runtimes into one entry. Click the arrow to see
-  what's inside, or click **Update** to install them all.
+  what's inside, or click **Update** to install the ticked ones.
+- **Developer tools** lists newer versions of programs you installed with cargo, npm or Homebrew.
 - A **Security** badge marks fixes for security problems. Install these soon. If you untick one,
   Depot reminds you at the top of the page.
 - Every update has a **tick box**, all ticked to start with. Untick the ones you want to skip;
@@ -141,7 +147,7 @@ lets you choose **Update anyway** or **Cancel**.
 
 The number next to **Updates** in the sidebar refreshes whenever Depot starts. The page says when it
 last checked. Click the **refresh** button (the circular arrow), or press **F5**, to check again right
-away. If Depot couldn't reach any software source, it says so and asks you to check your internet
+away (**Ctrl+R** and **Refresh** in the main menu work too). If Depot couldn't reach any software source, it says so and asks you to check your internet
 connection.
 
 ## 6. Clean up broken launchers
@@ -160,26 +166,37 @@ and how much space they take. Click **Clean up**, check the list, and click **Re
 Runtimes you installed yourself on purpose (Flatpak calls these "pinned") are never offered. If an
 app needs a removed runtime again later, Flatpak downloads it when you install that app.
 
-## 8. When something goes wrong
+## 8. Developer tools
+
+If you install programs with **cargo**, **npm**, **pipx**, **Homebrew** or **Nix**, Depot lists
+them under **Advanced → Developer tools**. Uninstalling one runs that tool's own uninstall command
+(for example `cargo uninstall`), without asking for your password. Depot won't remove a Homebrew
+package that another one still needs, and says which.
+
+Updates for cargo, npm and Homebrew programs show on the Updates page. pipx and Nix don't have a
+simple way to ask what's out of date, so update those with `pipx upgrade-all` or
+`nix profile upgrade` yourself.
+
+## 9. When something goes wrong
 
 | What you see | What to do |
 | --- | --- |
 | "Nothing was changed" | The password window was closed or the password was wrong. Press **Try again**. |
 | "Another app is installing or updating software right now" | The Software app or automatic updates are busy. Wait a minute, then press **Try again**. |
 | "The app is still open" | Close the app (Snaps refuse to update or remove a running app), then try again. |
-| "Some of them couldn't be removed" | The progress window lists what worked and what didn't. **Show details** says why; **Try again** retries only what's left. |
+| "2 of 3 apps were removed" | The progress window lists what worked and what didn't. **Show details** says why; **Try again** retries only what's left. |
 | "Couldn't read installed software" | Press **Try again**. If it keeps happening, please report it (below). |
 | "Couldn't check everything" on the Updates page | Check your internet connection, then click the refresh button. |
 | An app is missing or in the wrong place | Click the refresh button on the main page. If it's still wrong, please report it (below). |
 
-## 9. Menu, shortcuts and About
+## 10. Menu, shortcuts and About
 
-The menu button (three lines, top right) has **Select Apps**, **Keyboard Shortcuts** (also
+The menu button (three lines, top right) has **Refresh**, **Select Apps**, **Keyboard Shortcuts** (also
 **Ctrl+?**), **Privacy**, **Report a Problem** and **About Depot**. The About window shows the
 version, what's new, the licence and legal notices, and a **Troubleshooting** page you can copy
 into a bug report.
 
-Handy keys: **Ctrl+F** search, **F5** refresh, **Esc** go back or stop selecting, **Ctrl+A** select
+Handy keys: **Ctrl+F** search, **F5** or **Ctrl+R** refresh, **Esc** go back or stop selecting, **Ctrl+A** select
 all apps shown (while selecting), **Ctrl+Q** quit.
 
 ### Reporting a problem
@@ -187,7 +204,7 @@ all apps shown (while selecting), **Ctrl+Q** quit.
 Open a **Terminal** and run:
 
 ```sh
-depot --list-only > depot-report.json
+~/.local/bin/depot --list-only > ~/depot-report.json
 ```
 
 This saves a list of everything installed to `depot-report.json` in your home folder. Attach it to a

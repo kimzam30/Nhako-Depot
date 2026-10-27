@@ -26,4 +26,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo build --release
+      - run: cargo build --release --locked
+      - name: Check the licence list is up to date
+        run: ./scripts/third-party.py && git diff --exit-code data/third-party.txt
+      - name: Check the program runs on Ubuntu 24.04's glibc (2.39) or newer
+        run: |
+          need=$(objdump -T target/release/depot | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "needs glibc $need"
+          [ "$(printf '%s\n2.39\n' "$need" | sort -V | tail -1)" = 2.39 ]

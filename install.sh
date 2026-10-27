@@ -24,7 +24,7 @@ refresh_menus() {
 
 if [ "${1:-}" = "--uninstall" ]; then
     rm -f "$BIN" "$APPS/$APP_ID.desktop" "$ICONS/scalable/apps/$APP_ID.svg" "$METAINFO/$APP_ID.metainfo.xml"
-    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/depot"
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/depot" "${XDG_CONFIG_HOME:-$HOME/.config}/depot"
     refresh_menus
     echo "Depot has been removed."
     exit 0
