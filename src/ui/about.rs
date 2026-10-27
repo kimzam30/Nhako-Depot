@@ -58,6 +58,7 @@ const SHORTCUTS: &str = r#"<interface>
 pub fn menu() -> gio::Menu {
     let m = gio::Menu::new();
     let top = gio::Menu::new();
+    top.append(Some("Refresh"), Some("win.refresh"));
     top.append(Some("Select Apps"), Some("win.select"));
     m.append_section(None, &top);
     let help = gio::Menu::new();
@@ -99,6 +100,7 @@ pub fn install(st: &Rc<State>) {
         }
     });
     action(st, "quit", |st| st.win.close());
+    action(st, "refresh", super::refresh_view);
     if let Some(app) = st.win.application() {
         app.set_accels_for_action("win.shortcuts", &["<Control>question"]);
         app.set_accels_for_action("win.quit", &["<Control>q"]);

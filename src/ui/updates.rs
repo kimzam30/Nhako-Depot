@@ -88,9 +88,15 @@ impl View {
             .build();
         root.add_named(&offline, Some("offline"));
         let page = adw::PreferencesPage::new();
-        let note = gtk::Box::builder().spacing(8).halign(gtk::Align::Center).margin_top(12).build();
-        note.append(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
-        note.append(&label("You've unticked a security fix. It's best to install it soon.", &["warning"]));
+        let note = gtk::Box::builder()
+            .spacing(8)
+            .halign(gtk::Align::Center)
+            .margin_top(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        note.append(&gtk::Image::builder().icon_name("dialog-warning-symbolic").valign(gtk::Align::Start).build());
+        note.append(&widgets::wrapped("You've unticked a security fix. It's best to install it soon.", &["warning"]));
         let security_note = gtk::Revealer::builder()
             .child(&note)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -218,6 +224,10 @@ fn source(u: &Update) -> &'static str {
 
 fn update_button(st: &Rc<State>, list: Vec<Update>) -> gtk::Button {
     let b = gtk::Button::builder().label("Update").valign(gtk::Align::Center).build();
+    // every row has one, so say which app it updates
+    if let [u] = list.as_slice() {
+        b.update_property(&[gtk::accessible::Property::Label(&format!("Update {}", u.title))]);
+    }
     let st = st.clone();
     b.connect_clicked(move |_| run(&st, list.clone()));
     b
@@ -227,10 +237,12 @@ fn on_updates(st: &State) -> bool {
     st.view.visible_child_name().as_deref() == Some("updates")
 }
 
-/// A tick box for `keys`; toggling it by hand ticks or unticks all of them.
-fn tick(st: &Rc<State>, keys: Vec<String>) -> gtk::CheckButton {
+/// A tick box for `keys`, named `name` for screen readers; toggling it by hand ticks or unticks
+/// all of them.
+fn tick(st: &Rc<State>, keys: Vec<String>, name: &str) -> gtk::CheckButton {
     let c = gtk::CheckButton::builder().active(true).valign(gtk::Align::Center).build();
     c.set_tooltip_text(Some("Include in the next update"));
+    c.update_property(&[gtk::accessible::Property::Label(name)]);
     let st = st.clone();
     c.connect_toggled(move |c| {
         let v = &st.updates;
@@ -299,7 +311,7 @@ fn render(st: &Rc<State>) {
                 .title(glib::markup_escape_text(&u.title))
                 .subtitle(glib::markup_escape_text(&format!("{} · {}", versions(u), source(u))))
                 .build();
-            let c = tick(st, vec![key(u)]);
+            let c = tick(st, vec![key(u)], &format!("Include {} in the next update", u.title));
             row.add_prefix(&c);
             row.set_activatable_widget(Some(&c));
             v.checks.borrow_mut().push((key(u), c));
@@ -327,13 +339,14 @@ fn render(st: &Rc<State>) {
         let subtitle =
             format!("{}{}", plural(n, "package", "packages"), if security { ", including security fixes" } else { "" });
         let exp = adw::ExpanderRow::builder().title("System updates").subtitle(subtitle).build();
-        let all = tick(st, system.iter().map(key).collect());
+        let all = tick(st, system.iter().map(key).collect(), "Include all system updates");
         all.set_tooltip_text(Some("Include all system updates"));
         exp.add_prefix(&all);
         *v.system_check.borrow_mut() = Some(all);
         exp.add_prefix(&gtk::Image::builder().icon_name("system-software-update-symbolic").pixel_size(32).build());
         // installs the ticked system updates, not all of them
         let b = gtk::Button::builder().label("Update").valign(gtk::Align::Center).build();
+        b.update_property(&[gtk::accessible::Property::Label("Install the ticked system updates")]);
         {
             let (st, system) = (st.clone(), system.clone());
             b.connect_clicked(move |_| {
@@ -352,7 +365,7 @@ fn render(st: &Rc<State>) {
                 .title(glib::markup_escape_text(&u.title))
                 .subtitle(glib::markup_escape_text(&sub))
                 .build();
-            let c = tick(st, vec![key(u)]);
+            let c = tick(st, vec![key(u)], &format!("Include {} in the next update", u.title));
             row.add_prefix(&c);
             row.set_activatable_widget(Some(&c));
             v.checks.borrow_mut().push((key(u), c));
@@ -452,6 +465,15 @@ pub fn check(st: &Rc<State>, refresh: bool) {
         v.checking.set(false);
         render(&st);
         super::update_counts(&st);
+        if on_updates(&st) {
+            let n = v.pending.borrow().len();
+            let said = if n == 0 {
+                "Everything is up to date".to_string()
+            } else {
+                format!("{} available", plural(n, "update", "updates"))
+            };
+            widgets::announce(&v.root, &said);
+        }
         if let Some(refresh) = v.queued.take() {
             check(&st, refresh);
         }

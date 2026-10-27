@@ -19,6 +19,32 @@ pub fn wrapped(text: &str, classes: &[&str]) -> gtk::Label {
     l
 }
 
+/// Tell screen readers about a change they wouldn't otherwise hear about. GTK 4.14 crashes when
+/// asked to announce without a screen-reader connection (`GTK_A11Y=none`, or no accessibility
+/// bus), so nothing is said then: there's nobody to hear it.
+pub fn announce(w: &impl IsA<gtk::Widget>, text: &str) {
+    let w = w.upcast_ref::<gtk::Widget>();
+    if w.at_context().type_().name() == "GtkAtSpiContext" {
+        w.announce(text.trim_end_matches(['.', ' ']), gtk::AccessibleAnnouncementPriority::Medium);
+    }
+}
+
+/// Whether the desktop's screen reader is on, from GNOME's setting (other desktops: assumed off).
+pub fn screen_reader_on() -> bool {
+    const SCHEMA: &str = "org.gnome.desktop.a11y.applications";
+    gio::SettingsSchemaSource::default().and_then(|src| src.lookup(SCHEMA, true)).is_some_and(|s| {
+        s.has_key("screen-reader-enabled") && gio::Settings::new(SCHEMA).boolean("screen-reader-enabled")
+    })
+}
+
+/// A tick box whose label wraps instead of widening its dialog.
+pub fn check(text: &str) -> gtk::CheckButton {
+    let c = gtk::CheckButton::new();
+    let l = wrapped(text, &[]);
+    c.set_child(Some(&l));
+    c
+}
+
 fn pill(text: &str, class: &str, tip: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.add_css_class("badge");
@@ -124,7 +150,7 @@ pub fn card() -> gtk::Overlay {
         .can_focus(false)
         .build();
     tick.add_css_class("card-tick");
-    // the card itself is what's announced, with "selected" from the grid
+    // the card's grid cell is what's announced, marked selected by `select::Selection`
     tick.set_accessible_role(gtk::AccessibleRole::Presentation);
     o.add_overlay(&tick);
     o

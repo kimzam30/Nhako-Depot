@@ -98,6 +98,16 @@ impl Selection {
         let picked = self.on.get() && self.keys.borrow().contains(k);
         tick.set_visible(self.on.get());
         tick.set_active(picked);
+        // the grid has no selection of its own (clicks open cards), so the cell screen readers
+        // land on is told whether it's ticked; outside selection mode there's no such state.
+        // Not while the grid is still building the cell: GTK 4.14 trips over that.
+        let state = self.on.get().then_some(picked);
+        let card = card.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(cell) = card.upgrade().and_then(|c| c.parent()) {
+                cell.update_state(&[gtk::accessible::State::Selected(state)]);
+            }
+        });
         if picked {
             bx.add_css_class("selected");
         } else {
@@ -134,6 +144,10 @@ pub fn set_mode(st: &Rc<State>, on: bool) {
     }));
     st.select_all.set_visible(on);
     st.content.set_reveal_bottom_bars(on);
+    widgets::announce(
+        &st.win,
+        if on { "Selecting apps. Tick the ones you want to uninstall." } else { "Stopped selecting" },
+    );
     sel.sync();
     update_bar(st);
 }
@@ -201,8 +215,13 @@ fn update_bar(st: &Rc<State>) {
     if size > 0 {
         text.push_str(&format!(" · {}", glib::format_size(size)));
     }
-    if st.sel_label.text() != text && n > 0 {
-        st.win.upcast_ref::<gtk::Widget>().announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+    let before = st.sel_label.text();
+    if before != text && st.selection.on.get() {
+        if n > 0 {
+            widgets::announce(&st.win, &text);
+        } else if before.starts_with(|c: char| c.is_ascii_digit()) {
+            widgets::announce(&st.win, "Nothing selected");
+        }
     }
     st.sel_label.set_text(&text);
     st.sel_remove.set_sensitive(n > 0);

@@ -139,6 +139,7 @@ impl Busy {
         bx.append(&gtk::Label::new(Some("Checking…")));
         b.set_child(Some(&bx));
         b.set_sensitive(false);
+        widgets::announce(b, "Checking what would change");
         Busy(b.clone(), old)
     }
 }
@@ -174,10 +175,18 @@ fn start_with(st: &Rc<State>, pkgs: Vec<Package>, button: Option<&gtk::Button>, 
 }
 
 fn listing(lines: &[String]) -> gtk::ScrolledWindow {
-    let l = gtk::Label::builder().label(lines.join("\n")).xalign(0.0).selectable(true).build();
+    // long paths wrap rather than run off the side of a phone
+    let l = gtk::Label::builder()
+        .label(lines.join("\n"))
+        .xalign(0.0)
+        .selectable(true)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
     l.add_css_class("monospace");
     let sc = gtk::ScrolledWindow::builder()
         .child(&l)
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .min_content_height(40)
         .max_content_height(160)
         .propagate_natural_height(true)
@@ -294,11 +303,11 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, prev: Optio
             by_group.entry(group_name(q.kind)).or_default().push(line);
         }
         for (g, lines) in by_group {
-            content.append(&widgets::label(&format!("{g} ({})", lines.len()), &["heading"]));
+            content.append(&widgets::wrapped(&format!("{g} ({})", lines.len()), &["heading"]));
             content.append(&listing(&lines));
         }
         if !extra.is_empty() {
-            content.append(&widgets::label(
+            content.append(&widgets::wrapped(
                 &format!("Also removed, because they need these apps ({})", extra.len()),
                 &["heading"],
             ));
@@ -306,11 +315,12 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, prev: Optio
         }
     }
     let orphans = &plan.orphans;
-    let clean = gtk::CheckButton::builder()
-        .label(format!("Also remove {} that nothing else needs any more", plural(orphans.len(), "package", "packages")))
-        .active(!prev.is_some_and(|c| c.orphans_unticked))
-        .tooltip_text("These were installed automatically for other software that is no longer here.")
-        .build();
+    let clean = widgets::check(&format!(
+        "Also remove {} that nothing else needs any more",
+        plural(orphans.len(), "package", "packages")
+    ));
+    clean.set_active(!prev.is_some_and(|c| c.orphans_unticked));
+    clean.set_tooltip_text(Some("These were installed automatically for other software that is no longer here."));
     if !orphans.is_empty() {
         content.append(&clean);
         content.append(&listing(orphans));
@@ -348,7 +358,7 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, prev: Optio
             Kind::Cargo | Kind::Npm | Kind::Pipx | Kind::Brew | Kind::Nix => continue,
         };
         let label = if single { label } else { label.replace("its ", "their ").replace(" of its", " of their") };
-        let c = gtk::CheckButton::with_label(&label);
+        let c = widgets::check(&label);
         c.set_active(prev.is_some_and(|p| p.purge.contains(&k)));
         if !single {
             c.set_tooltip_text(Some(&format!("For the {} in this list", group_name(k).to_lowercase())));
@@ -356,11 +366,9 @@ fn confirm(st: &Rc<State>, pkgs: Rc<Vec<Package>>, plan: RemovePlan, prev: Optio
         content.append(&c);
         purges.push((k, c));
     }
-    let unused = gtk::CheckButton::builder()
-        .label("Also remove shared Flatpak runtimes that no app uses any more")
-        .tooltip_text("Frees space. Apps that need a runtime again download it when they're installed.")
-        .active(prev.is_some_and(|c| c.unused_runtimes))
-        .build();
+    let unused = widgets::check("Also remove shared Flatpak runtimes that no app uses any more");
+    unused.set_tooltip_text(Some("Frees space. Apps that need a runtime again download it when they're installed."));
+    unused.set_active(prev.is_some_and(|c| c.unused_runtimes));
     if kinds.contains(&Kind::Flatpak) {
         content.append(&unused);
     }

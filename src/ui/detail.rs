@@ -248,6 +248,7 @@ fn copies(st: &Rc<State>, p: &Rc<Package>, others: &[Package]) -> adw::Preferenc
             row.add_suffix(&label("This page", &["dim-label", "caption"]));
         } else {
             let b = gtk::Button::builder().label("Show").valign(gtk::Align::Center).build();
+            b.update_property(&[gtk::accessible::Property::Label(&format!("Show the {} copy", c.kind.badge()))]);
             let (st, c) = (st.clone(), c.clone());
             let rest: Vec<Package> = all.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| o.clone()).collect();
             b.connect_clicked(move |_| {
@@ -298,6 +299,7 @@ fn opened(st: &State, started: Result<(), String>, button: &gtk::Button) {
         return;
     }
     button.set_label("Opening…");
+    widgets::announce(button, "Opening");
     button.set_sensitive(false);
     let b = button.downgrade();
     glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {

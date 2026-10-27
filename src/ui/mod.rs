@@ -5,9 +5,12 @@ mod detail;
 pub mod operation;
 mod remove;
 mod select;
+#[cfg(debug_assertions)]
+mod tour;
 mod updates;
 mod widgets;
 
+use crate::system::plural;
 use adw::prelude::*;
 use depot_core::{Env, Inventory, Kind, Package, Role};
 use gtk::{gdk, gio, glib};
@@ -377,11 +380,14 @@ pub fn activate(app: &adw::Application) {
     hb.pack_end(&select);
     let select_all =
         gtk::Button::builder().label("Select all").visible(false).tooltip_text("Tick every app shown (Ctrl+A)").build();
-    hb.pack_end(&select_all);
     let sort_dd = gtk::DropDown::from_strings(&["Name", "Size (largest first)"]);
     sort_dd.set_tooltip_text(Some("Sort by"));
     sort_dd.update_property(&[gtk::accessible::Property::Label("Sort by")]);
-    hb.pack_end(&sort_dd);
+    // the phone layout hides this holder, and the Updates page the menu itself, so neither undoes
+    // the other
+    let sort_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    sort_slot.append(&sort_dd);
+    hb.pack_end(&sort_slot);
     tv.add_top_bar(&hb);
     let unsupported = adw::Banner::new(
         "Depot can't read this system's own packages yet, so apps that came with it may show up as manual installs.",
@@ -393,6 +399,13 @@ pub fn activate(app: &adw::Application) {
     // the selection bar, slid in from the bottom in selection mode
     let bar = gtk::ActionBar::new();
     let sel_label = widgets::label("", &["heading"]);
+    // two lines on a phone rather than a wider window
+    sel_label.set_wrap(true);
+    sel_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    sel_label.set_lines(2);
+    sel_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    sel_label.set_hexpand(true);
+    bar.pack_start(&select_all);
     bar.pack_start(&sel_label);
     let sel_remove = gtk::Button::with_label("Uninstall");
     sel_remove.add_css_class("destructive-action");
@@ -446,8 +459,12 @@ pub fn activate(app: &adw::Application) {
         .margin_bottom(12)
         .build();
 
-    let stack =
-        gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).transition_duration(200).build();
+    // sized by the page shown, not the widest one, so a wide page can't widen a phone window
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .transition_duration(200)
+        .hhomogeneous(false)
+        .build();
     stack.add_named(&skeleton(), Some("loading"));
     stack.add_named(
         &gtk::ScrolledWindow::builder().child(&grid).hscrollbar_policy(gtk::PolicyType::Never).build(),
@@ -468,8 +485,11 @@ pub fn activate(app: &adw::Application) {
         .child(&retry)
         .build();
     stack.add_named(&failed, Some("failed"));
-    let view =
-        gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).transition_duration(200).build();
+    let view = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .transition_duration(200)
+        .hhomogeneous(false)
+        .build();
     view.add_named(&stack, Some("browse"));
     view.add_named(&upd.root, Some("updates"));
     tv.set_content(Some(&view));
@@ -491,7 +511,9 @@ pub fn activate(app: &adw::Application) {
     ));
     phone.add_setter(&split, "collapsed", Some(&true.to_value()));
     phone.add_setter(&toggle, "active", Some(&false.to_value()));
-    phone.add_setter(&sort_dd, "visible", Some(&false.to_value()));
+    phone.add_setter(&sort_slot, "visible", Some(&false.to_value()));
+    // Refresh is in the main menu too, and on F5 and Ctrl+R
+    phone.add_setter(&refresh, "visible", Some(&false.to_value()));
     win.add_breakpoint(narrow);
     win.add_breakpoint(phone);
 
@@ -532,6 +554,19 @@ pub fn activate(app: &adw::Application) {
     });
     select::connect(&st);
     about::install(&st);
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("DEPOT_TOUR") {
+        win.set_default_size(tour::WIDTH, tour::HEIGHT);
+        // Broadway reports no text DPI, which stops breakpoints in `sp` from ever matching
+        if let Some(s) = gtk::Settings::default() {
+            if s.gtk_xft_dpi() <= 0 {
+                s.set_gtk_xft_dpi(96 * 1024);
+            }
+            // as on GNOME and phones; Broadway would show three window buttons
+            s.set_gtk_decoration_layout(Some("appmenu:close"));
+        }
+        tour::start(&st, dir.into());
+    }
 
     // ---- signals
     {
@@ -545,6 +580,13 @@ pub fn activate(app: &adw::Application) {
             *query.borrow_mut() = e.text().trim().to_lowercase();
             filter.changed(gtk::FilterChange::Different);
             update_stack(&st);
+            // the grid changes out of sight of a screen reader still in the search box
+            if !e.text().trim().is_empty() && !st.loading.get() {
+                let n = st.filtered.n_items() as usize;
+                let said =
+                    if n == 0 { "No results".to_string() } else { format!("{} found", plural(n, "app", "apps")) };
+                widgets::announce(e, &said);
+            }
         });
     }
     {
@@ -778,7 +820,11 @@ fn update_runtimes_banner(st: &State) {
         };
         st.runtimes_banner.set_title(&format!("{what} ({})", glib::format_size(size)));
     }
-    st.runtimes_banner.set_revealed(on_page && !unused.is_empty());
+    let show = on_page && !unused.is_empty();
+    if show && !st.runtimes_banner.is_revealed() {
+        widgets::announce(&st.runtimes_banner, &st.runtimes_banner.title());
+    }
+    st.runtimes_banner.set_revealed(show);
 }
 
 /// Show or hide sidebar rows: advanced ones follow the toggle, empty ones hide (except "All apps").
@@ -789,6 +835,7 @@ fn update_rows(st: &State) {
         let show = match r.nav {
             Nav::Updates => true,
             Nav::Advanced => {
+                r.row.update_state(&[gtk::accessible::State::Expanded(Some(adv))]);
                 if let Some(c) = &r.chevron {
                     if adv {
                         c.add_css_class("open");
@@ -892,6 +939,9 @@ fn bump(l: &gtk::Label) {
 
 fn loaded(st: &Rc<State>, inv: Inventory) {
     let mut counts = vec![0usize; CATS.len()];
+    if !inv.system_packages && !st.unsupported.is_revealed() {
+        widgets::announce(&st.unsupported, &st.unsupported.title());
+    }
     st.unsupported.set_revealed(!inv.system_packages);
     let all = Rc::new(inv.packages);
     *st.packages.borrow_mut() = all.clone();

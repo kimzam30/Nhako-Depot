@@ -52,6 +52,7 @@ pub enum Choice {
 struct Row {
     state: gtk::Stack,
     note: gtk::Label,
+    name: String,
 }
 
 pub struct Operation {
@@ -93,8 +94,10 @@ fn centered(l: gtk::Label) -> gtk::Label {
     l
 }
 
-fn state_icon(name: &str, class: &str) -> gtk::Image {
+/// An icon that says something: `said` is what screen readers hear instead.
+fn state_icon(name: &str, class: &str, said: &str) -> gtk::Image {
     let i = gtk::Image::from_icon_name(name);
+    i.update_property(&[gtk::accessible::Property::Label(said)]);
     if !class.is_empty() {
         i.add_css_class(class);
     }
@@ -109,6 +112,7 @@ impl Operation {
             .transition_type(gtk::StackTransitionType::Crossfade)
             .transition_duration(200)
             .vhomogeneous(false)
+            .hhomogeneous(false)
             .interpolate_size(true)
             .build();
 
@@ -141,7 +145,7 @@ impl Operation {
         bx.append(&status);
 
         let ok = gtk::Box::builder().spacing(6).halign(gtk::Align::Center).build();
-        ok.append(&state_icon("emblem-ok-symbolic", "success"));
+        ok.append(&state_icon("emblem-ok-symbolic", "success", ""));
         ok.append(&label("Password accepted", &["success", "caption-heading"]));
         let authorized = gtk::Revealer::builder()
             .child(&ok)
@@ -166,18 +170,20 @@ impl Operation {
                     .transition_type(gtk::StackTransitionType::Crossfade)
                     .transition_duration(150)
                     .build();
-                state.add_named(&state_icon("content-loading-symbolic", "dim-label"), Some("waiting"));
-                state.add_named(&gtk::Spinner::builder().spinning(true).build(), Some("working"));
-                let done = state_icon("emblem-ok-symbolic", "success");
+                state.add_named(&state_icon("content-loading-symbolic", "dim-label", "Waiting"), Some("waiting"));
+                let spinner = gtk::Spinner::builder().spinning(true).build();
+                spinner.update_property(&[gtk::accessible::Property::Label("Working")]);
+                state.add_named(&spinner, Some("working"));
+                let done = state_icon("emblem-ok-symbolic", "success", "Done");
                 done.add_css_class("op-pop");
                 state.add_named(&done, Some("done"));
-                state.add_named(&state_icon("dialog-error-symbolic", "error"), Some("failed"));
-                state.add_named(&state_icon("action-unavailable-symbolic", "dim-label"), Some("skipped"));
+                state.add_named(&state_icon("dialog-error-symbolic", "error", "Failed"), Some("failed"));
+                state.add_named(&state_icon("action-unavailable-symbolic", "dim-label", "Skipped"), Some("skipped"));
                 row.add_prefix(&state);
                 let note = label("", &["caption", "dim-label"]);
                 row.add_suffix(&note);
                 list.append(&row);
-                rows.push(Row { state, note });
+                rows.push(Row { state, note, name: it.clone() });
             }
             let sc = gtk::ScrolledWindow::builder()
                 .child(&list)
@@ -299,6 +305,7 @@ impl Operation {
                 {
                     b.set_sensitive(false);
                     b.set_label("Cancelling…");
+                    op.announce("Cancelling");
                     c.cancel();
                 }
             });
@@ -335,6 +342,7 @@ impl Operation {
             op.result.copy.connect_clicked(move |b| {
                 b.clipboard().set_text(&text.text());
                 b.set_label("Copied");
+                super::widgets::announce(b, "Copied");
             });
         }
         op
@@ -361,11 +369,8 @@ impl Operation {
         self.phase.set_visible_child_name(phase);
     }
 
-    /// Tell screen readers about a change they wouldn't otherwise hear about.
     fn announce(&self, text: &str) {
-        self.dialog
-            .upcast_ref::<gtk::Widget>()
-            .announce(text.trim_end_matches(['.', ' ']), gtk::AccessibleAnnouncementPriority::Medium);
+        super::widgets::announce(&self.dialog, text);
     }
 
     /// A small line under the progress bar; empty hides it.
@@ -396,6 +401,9 @@ impl Operation {
     /// The password worked; the work itself starts now.
     pub fn authorized(&self) {
         self.show_phase("busy");
+        if !self.authorized.reveals_child() {
+            self.announce("Password accepted");
+        }
         self.authorized.set_reveal_child(true);
         self.set_hint("");
     }
@@ -437,6 +445,10 @@ impl Operation {
             ItemState::Skipped => "skipped",
         });
         r.note.set_text(note);
+        // what finished is said aloud; "working" is already clear from the status line
+        if matches!(state, ItemState::Done | ItemState::Failed) && !note.is_empty() {
+            self.announce(&format!("{}: {note}", r.name));
+        }
     }
 
     /// Offer Cancel while `c` can still stop the work; `None` hides it. Once Cancel was pressed
@@ -462,7 +474,7 @@ impl Operation {
     }
 
     /// Show how it went and wait for the user's choice. A plain success closes by itself after a
-    /// moment, unless the pointer is over the sheet.
+    /// moment, unless the pointer is over the sheet or a screen reader is still reading it out.
     pub async fn finish(self: &Rc<Self>, r: Result) -> Choice {
         if self.closed.get() {
             return Choice::Done;
@@ -503,10 +515,12 @@ impl Operation {
         } else {
             p.done.grab_focus();
         }
+        // focus passing through the selectable message on the way selects all of it
+        p.body.select_region(0, 0);
 
         let (tx, rx) = oneshot::channel();
         *self.choice.borrow_mut() = Some(tx);
-        if r.ending == Ending::Success {
+        if r.ending == Ending::Success && !super::widgets::screen_reader_on() {
             let w = Rc::downgrade(self);
             glib::timeout_add_local_once(Duration::from_millis(2500), move || {
                 if let Some(op) = w.upgrade()
